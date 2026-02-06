@@ -744,7 +744,7 @@ class SimilaritySearchService:
             )
 
             # Create A's cluster and find all similar images and put them in
-            cluster_info = SimilarityClusters.search_cluster(vector=image_phash)
+            # cluster_info = SimilarityClusters.search_cluster(vector=image_phash)
 
             # Create documents for disliked physical_ids
             # Put the A cluster in as "disliked_cluster_ids"
@@ -754,7 +754,7 @@ class SimilaritySearchService:
                 new_doc = {
                     "phash_2d": val,
                     "type": "2d",
-                    "disliked_cluster_ids": [cluster_info["doc_id"]],
+                    # "disliked_cluster_ids": [cluster_info["doc_id"]],
                     "org_id": company_id,
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
@@ -784,6 +784,41 @@ class SimilaritySearchService:
             )
 
 
+class DummyOCRResult:
+    def __init__(
+        self,
+        ocr_product_name=None,
+        ocr_product_code=None,
+        ocr_drawing_number=None,
+        ocr_drawing_issuer=None,
+    ):
+        self.ocr_product_name = ocr_product_name
+        self.ocr_product_code = ocr_product_code
+        self.ocr_drawing_number = ocr_drawing_number
+        self.ocr_drawing_issuer = ocr_drawing_issuer
+
+
 if __name__ == "__main__":
+    import pandas as pd
+
+    from get_diagram_ocr import get_diagram_ocr_physical_types
 
     similarity_search_service = SimilaritySearchService()
+
+    project_id = "1770382286045"
+    company_id = "3"
+    ocr_result = DummyOCRResult()
+    basic_info_metadata = get_diagram_ocr_physical_types(company_id)
+    feedback_list = []
+    show_disliked_drawings = True
+
+    res = similarity_search_service.ranking_project_ref(
+        project_id=project_id,
+        company_id=company_id,
+        ocr_result=ocr_result,
+        basic_info_metadata=basic_info_metadata,
+        feedback_list=feedback_list,
+        show_disliked_drawings=show_disliked_drawings,
+    )
+
+    print(f"res: {res}")

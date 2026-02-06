@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 from ultralytics import YOLO
 
-from config import Settings as settings
+from config import settings
 from s3_utils import s3
 
 
