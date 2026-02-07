@@ -5,24 +5,37 @@ from elasticsearch_constants import ESConstant
 from interaction import ElasticsearchBase
 
 
+
 class SimilarityClusters:
-    def __init__(self, elasticsearch_db: ElasticsearchBase):
+    def __init__(
+        self,
+        elasticsearch_db: ElasticsearchBase,
+        cluster_similarity_threshold: float = 0.98,
+        retrieved_prod_similarity_threshold: float = 0.8,
+    ):
         self.elasticsearch_db = elasticsearch_db
+        self.cluster_similarity_threshold = cluster_similarity_threshold
+        self.retrieved_prod_similarity_threshold = retrieved_prod_similarity_threshold
 
     def _ensure_existence(self):
-        """
-        Ensure the SimilarityClusters exists, otherwise, create it.
-        """
+        """Ensure the similarity clusters index exists (create if missing)."""
+
         self.elasticsearch_db.check_indice_existance(
-            indice_name=Constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            indice_name=Constants.SIMILARITY_CLUSTERS,
             create=True,
             body=ESConstant.SCHEMA_SIMILARITY_CLUSTERS,
         )
 
-    def _create_cluster_from_vector(self, vector, org_id: int | str, score_threshold: float = 0.8) -> Dict:
+    def _create_cluster_from_vector(
+        self,
+        vector,
+        org_id: int | str,
+    ) -> Dict:
         """
-        Create a new similarity cluster by searching similar products first.
+        Create a new similarity cluster from a vector by retrieving
+        similar product IDs and storing them in a new document.
         """
+
         result = {
             "doc_id": None,
             "similarity_score": None,
@@ -39,16 +52,16 @@ class SimilarityClusters:
                 {"term": {"version": "v3"}},
             ],
             selected_cols=["product_id"],
-            score_threshold=score_threshold
+            score_threshold=self.retrieved_prod_similarity_threshold,
         )
 
         if not similar_resp or not similar_resp["hits"]["hits"]:
             return result
 
         physical_ids = [
-            hit["_source"]["physical_id"]
+            hit["_source"]["product_id"]
             for hit in similar_resp["hits"]["hits"]
-            if "physical_id" in hit["_source"]
+            if "product_id" in hit["_source"]
         ]
 
         doc_body = {
@@ -75,7 +88,12 @@ class SimilarityClusters:
         search_field: str,
         filters: Optional[List[Dict]],
     ) -> Dict:
-        """Search or create new cluster"""
+        """
+        Find an existing cluster for the vector, or create one if none exists.
+        """
+
+        # Step 1: Make sure the index exists
+        self._ensure_existence()
 
         result = {
             "doc_id": None,
@@ -83,15 +101,17 @@ class SimilarityClusters:
             "physical_ids": None,
         }
 
-        # Step 1: Use the vector to search for the identical document.
+        # Step 2: Use the vector to search for the identical document.
 
         resp = self.elasticsearch_db.search_vector_w_filters(
             indice_name=Constants.SIMILARITY_CLUSTERS,
             query_vector=vector,
             number_retrieval_vector=1,
-            search_field=search_field,  # "embedding_vector_2d" or "embedding_vector_3d"
+            search_field=search_field,  # "embedding_vector_2D" or "embedding_vector_3D"
             filters=filters,
-            selected_cols=[],  # TODO: Test later
+            selected_cols=["physical_ids"],
+            vector_method="l2",
+            score_threshold=self.cluster_similarity_threshold,
         )
 
         # No hits at all
