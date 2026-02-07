@@ -48,7 +48,7 @@ class Constants:
     ZONE_ENCODED_DATA_PHYSICAL_OBJECT = "encoded_data_physical_object"
     ZONE_ENCODED_DATA_PHYSICAL_OBJECT_2D = "encoded_data_physical_object_2d"
     ZONE_MATERIAL_CACHED = "material_knowledge"
-    ROCCHIO_HISTORY_PHYSICAL_OBJECT = "rocchio_history_physical_object"
+    ROCCHIO_HISTORY_PHYSICAL_OBJECT = "rocchio_history_physical_object_1"
     SIMILARITY_CLUSTERS = "similarity_clusters"
 
 
