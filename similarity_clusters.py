@@ -5,7 +5,6 @@ from elasticsearch_constants import ESConstant
 from interaction import ElasticsearchBase
 
 
-
 class SimilarityClusters:
     def __init__(
         self,
@@ -86,7 +85,6 @@ class SimilarityClusters:
         vector,
         org_id: int | str,
         search_field: str,
-        filters: Optional[List[Dict]],
     ) -> Dict:
         """
         Find an existing cluster for the vector, or create one if none exists.
@@ -108,7 +106,7 @@ class SimilarityClusters:
             query_vector=vector,
             number_retrieval_vector=1,
             search_field=search_field,  # "embedding_vector_2D" or "embedding_vector_3D"
-            filters=filters,
+            filters=[{"term": {"org_id": org_id}}],
             selected_cols=["physical_ids"],
             vector_method="l2",
             score_threshold=self.cluster_similarity_threshold,
