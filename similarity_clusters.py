@@ -19,7 +19,7 @@ class SimilarityClusters:
             body=ESConstant.SCHEMA_SIMILARITY_CLUSTERS,
         )
 
-    def _create_cluster_from_vector(self, vector, org_id: int | str) -> Dict:
+    def _create_cluster_from_vector(self, vector, org_id: int | str, score_threshold: float = 0.8) -> Dict:
         """
         Create a new similarity cluster by searching similar products first.
         """
@@ -38,7 +38,8 @@ class SimilarityClusters:
                 {"term": {"organization_id": org_id}},
                 {"term": {"version": "v3"}},
             ],
-            selected_cols=["physical_id"],
+            selected_cols=["product_id"],
+            score_threshold=score_threshold
         )
 
         if not similar_resp or not similar_resp["hits"]["hits"]:

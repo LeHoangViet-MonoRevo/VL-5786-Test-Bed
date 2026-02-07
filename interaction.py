@@ -73,6 +73,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         filters: Optional[List[Dict]] = None,
         selected_cols=["product_id", "original_image"],
         vector_method: str = "l2",  # "cosine", "dot", "l2"
+        score_threshold: float | None = None,
     ):
         try:
             if filters is None:
@@ -86,7 +87,6 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             elif vector_method == "dot":
                 script_source = f"dotProduct(params.query_vector, '{search_field}')"
             elif vector_method == "l2":
-                # Convert L2 distance to a score (higher = more similar)
                 script_source = (
                     f"1 / (1 + l2norm(params.query_vector, '{search_field}'))"
                 )
@@ -106,6 +106,10 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     }
                 },
             }
+
+            # 🔥 Apply threshold
+            if score_threshold is not None:
+                query_body["min_score"] = score_threshold
 
             results = self.client.search(index=indice_name, body=query_body)
             return results
