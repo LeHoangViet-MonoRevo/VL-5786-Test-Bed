@@ -22,6 +22,8 @@ if __name__ == "__main__":
     image_phash = extract_feature_v3(image)
 
     # ---- Two-Way Response START ----
+
+    # -- Step 1: Get dislikes' phases (Currently, only support 2D) --
     disliked_info_response = elasticsearch_db.find(
         indice_name=constants.ELASTICSEARCH_PREFIX,
         query={
@@ -49,24 +51,19 @@ if __name__ == "__main__":
 
     print(f"disliked_phashes: {disliked_phashes}")
 
-    # Create A's cluster and find all similar images and put them in
+    # -- Step 1: End --
+
+    # -- Step 2: Get cluster info (Currently, only support 2D) --
     cluster_info = similarity_clusters.search_cluster(
         vector=image_phash,
         org_id=company_id,
         search_field="embedding_vector_2D",
     )
 
-    # Create documents for disliked physical_ids
-    # Put the A cluster in as "disliked_cluster_ids"
-    phys_ids = list(disliked_phashes.keys())
-    vectors = np.array(list(disliked_phashes.values()))
+    # -- Step 2: End --
 
-    unique_vectors, keep_indices = unique_vectors_by_similarity(vectors)
-
-    # Rebuild dict with only unique ones
-    unique_disliked_phashes = {phys_ids[i]: vectors[i] for i in keep_indices}
-
-    for key, val in unique_disliked_phashes.items():
+    # -- Step 3: Add the cluster_id to the Rocchio documents of these dislikes (Currently, only support 2D) --
+    for key, val in disliked_phashes.items():
         new_doc = {
             "phash_2d": val,
             "type": "2d",
@@ -87,8 +84,6 @@ if __name__ == "__main__":
             check_and_create=True,
             filters=[{"term": {"type": "2d"}}, {"term": {"org_id": company_id}}],
         )
-
-        print(f"matches: {matches}")
 
         # If there is 1 match exists, use update
         if matches.get("doc_id", None) is not None:
@@ -151,5 +146,7 @@ if __name__ == "__main__":
                 document=new_doc,
                 refresh="wait_for",
             )
+
+    # -- Step 3: End --
 
     # ---- Two-Way Response END ----
