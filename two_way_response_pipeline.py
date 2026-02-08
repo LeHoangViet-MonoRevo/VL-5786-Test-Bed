@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 
 from constants import constants
+from feedback_2d import RocchioFeedback2D
 from interaction import elasticsearch_db
 from similarity_clusters import SimilarityClusters
 from two_way_response_utils import (build_product_embedding_map,
@@ -13,6 +14,7 @@ from two_way_response_utils import (build_product_embedding_map,
 if __name__ == "__main__":
 
     similarity_clusters = SimilarityClusters(elasticsearch_db)
+    rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
     disliked_phys_ids = {(1303, datetime.now()), (1229, datetime.now())}
     company_id = 1
 
@@ -64,7 +66,6 @@ if __name__ == "__main__":
     # Rebuild dict with only unique ones
     unique_disliked_phashes = {phys_ids[i]: vectors[i] for i in keep_indices}
 
-    # TODO 2-way response: Dont create duplicate document
     for key, val in unique_disliked_phashes.items():
         new_doc = {
             "phash_2d": val,
@@ -77,10 +78,78 @@ if __name__ == "__main__":
             "updated_at": datetime.now(),
         }
 
-        elasticsearch_db.client.index(
-            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-            document=new_doc,
-            refresh="wait_for",
+        # From this phash, find similar document in the Rocchio index
+        # What function does this in feedback_2d.py
+
+        matches = rocchio_feedback_2d.find_similar_rocchio_record(
+            query_vector=val,
+            search_field="phash_2d",
+            check_and_create=True,
+            filters=[{"term": {"type": "2d"}}, {"term": {"org_id": company_id}}],
         )
+
+        print(f"matches: {matches}")
+
+        # If there is 1 match exists, use update
+        if matches.get("doc_id", None) is not None:
+            new_cluster_id = cluster_info["doc_id"]
+            now = datetime.now()
+
+            update_body = {
+                "script": {
+                    "lang": "painless",
+                    "source": """
+                        if (ctx._source.disliked_cluster_ids == null) {
+                            ctx._source.disliked_cluster_ids = [];
+                        }
+
+                        boolean exists = false;
+                        for (item in ctx._source.disliked_cluster_ids) {
+                            if (item.cluster_id == params.cluster_id) {
+                                exists = true;
+                                break;
+                            }
+                        }
+
+                        if (!exists) {
+                            ctx._source.disliked_cluster_ids.add([
+                                "cluster_id": params.cluster_id,
+                                "timestamp": params.timestamp
+                            ]);
+                        }
+
+                        ctx._source.updated_at = params.timestamp;
+                    """,
+                    "params": {
+                        "cluster_id": new_cluster_id,
+                        "timestamp": now,
+                    },
+                }
+            }
+
+            elasticsearch_db.client.update(
+                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                id=matches["doc_id"],
+                body=update_body,
+                refresh="wait_for",
+            )
+
+        else:
+            new_doc = {
+                "phash_2d": val,
+                "type": "2d",
+                "disliked_cluster_ids": [
+                    {"cluster_id": cluster_info["doc_id"], "timestamp": datetime.now()}
+                ],
+                "org_id": company_id,
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+            }
+
+            elasticsearch_db.client.index(
+                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                document=new_doc,
+                refresh="wait_for",
+            )
 
     # ---- Two-Way Response END ----
