@@ -322,6 +322,10 @@ class SimilaritySearchService:
         org_id: int,
         version: Union[str, List[str]] = ["3d", "v3"],
     ) -> pd.DataFrame:
+        """
+        Build a DataFrme of disliked items by fetching their metadata
+        from ElasticSearch.
+        """
 
         if not disliked_phys_ids:
             return pd.DataFrame(
