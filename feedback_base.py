@@ -144,6 +144,7 @@ class RocchioFeedbackBase:
             "rocchio_pos_vec_2d": None,
             "rocchio_neg_vec_2d": None,
             "interactions": [],
+            "disliked_cluster_ids": [],
         }
 
         # Step 1: Find matches in ES db
@@ -159,6 +160,7 @@ class RocchioFeedbackBase:
                 "rocchio_pos_vec_3d",
                 "rocchio_neg_vec_3d",
                 "interactions",
+                "disliked_cluster_ids",
             ],
         )
 
@@ -198,6 +200,9 @@ class RocchioFeedbackBase:
 
         if "interactions" in source:
             result["interactions"] = source["interactions"]
+            
+        if "disliked_cluster_ids" in source:
+            result["disliked_cluster_ids"] = source["disliked_cluster_ids"]
 
         return result
 
