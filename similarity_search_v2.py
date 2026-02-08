@@ -384,9 +384,9 @@ class SimilaritySearchService:
     def filter_and_sync_neutral_feedback_2d(
         self,
         feedback_list: List[Tuple[Any, int]],
-        disliked_phys_ids: Set,
+        disliked_phys_ids: Set[Tuple[int, datetime]],
         matches: Dict,
-    ) -> Set:
+    ) -> Set[Tuple[int, datetime]]:
         """
         Remove neutralised dislikes and sync changes to Elasticsearch.
         """
@@ -714,9 +714,65 @@ class SimilaritySearchService:
                 if inter["reaction"] == -1
             )
 
+            # Always initialize first
+            disliked_physical_ids_from_clusters = set()
+
+            # Count all the phys_ids from disliked_cluster_ids here
+            if matches.get("disliked_cluster_ids", []):
+                # Build mapping: cluster_id -> timestamp
+                cluster_id_to_ts = {
+                    cluster_doc_id: ts
+                    for (cluster_doc_id, ts) in matches["disliked_cluster_ids"]
+                }
+
+                disliked_cluster_ids = list(cluster_id_to_ts.keys())
+
+                query = {
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"ids": {"values": disliked_cluster_ids}},
+                                {"term": {"org_id": company_id}},
+                            ]
+                        }
+                    },
+                    "_source": ["physical_ids"],
+                }
+
+                # Ensure index exists before searching
+                self.similarity_clusters._ensure_existence()
+
+                resp = elasticsearch_db.client.search(
+                    index=constants.SIMILARITY_CLUSTERS,
+                    body=query,
+                    size=len(disliked_cluster_ids),
+                )
+
+                for hit in resp["hits"]["hits"]:
+                    cluster_id = hit["_id"]
+                    ts = cluster_id_to_ts.get(cluster_id)
+
+                    for phys_id in hit["_source"].get("physical_ids", []):
+                        disliked_physical_ids_from_clusters.add((phys_id, ts))
+
             disliked_phys_ids = self.filter_and_sync_neutral_feedback_2d(
                 feedback_list, disliked_phys_ids, matches
             )
+
+            # Combine the disliked_physical_ids_from_clusters + disliked_phys_ids from feedback
+            combined = disliked_physical_ids_from_clusters | disliked_phys_ids
+
+            # Deduplicate by physical_id, keep newest timestamp
+            latest_by_phys_id = {}
+
+            for phys_id, ts in combined:
+                if phys_id not in latest_by_phys_id or ts > latest_by_phys_id[phys_id]:
+                    latest_by_phys_id[phys_id] = ts
+
+            # Back to Set[(physical_id, datetime)]
+            merged_disliked_phys_ids = {
+                (phys_id, ts) for phys_id, ts in latest_by_phys_id.items()
+            }
 
             # ---- Two-Way Response START ----
 
@@ -747,8 +803,6 @@ class SimilaritySearchService:
             disliked_phashes = SimilaritySearchService.build_product_embedding_map(
                 disliked_info_response
             )
-
-            print(f"disliked_phashes: {disliked_phashes}")
 
             # -- Step 1: End --
 
@@ -861,7 +915,10 @@ class SimilaritySearchService:
 
             final_result["reaction"] = 0
             final_result = self.apply_disliked_drawings(
-                final_result, disliked_phys_ids, company_id, show_disliked_drawings
+                final_result,
+                merged_disliked_phys_ids,
+                company_id,
+                show_disliked_drawings,
             )
 
             return final_result[["physical_id", "score", "parent", "reaction"]].to_dict(
@@ -901,11 +958,32 @@ if __name__ == "__main__":
 
     similarity_search_service = SimilaritySearchService()
 
-    project_id = "1770382286045"
-    company_id = "3"
+    project_id = "1770541252583"
+    company_id = "1"
     ocr_result = DummyOCRResult()
     basic_info_metadata = get_diagram_ocr_physical_types(company_id)
-    feedback_list = []
+    feedback_list = [
+        (1266, 0),
+        (1265, 0),
+        (414, 0),
+        (1626, 0),
+        (265798, 0),
+        (82, 0),
+        (9009, 0),
+        (616, 0),
+        (21, 0),
+        (1146, 0),
+        (1070, 0),
+        (978, 0),
+        (958, 0),
+        (951, 0),
+        (945, 0),
+        (944, 0),
+        (913, 0),
+        (911, 0),
+        (908, 0),
+        (905, -1),
+    ]
     show_disliked_drawings = True
 
     res = similarity_search_service.ranking_project_ref(
@@ -917,4 +995,4 @@ if __name__ == "__main__":
         show_disliked_drawings=show_disliked_drawings,
     )
 
-    print(f"res: {res}")
+    # print(f"res: {res}")
