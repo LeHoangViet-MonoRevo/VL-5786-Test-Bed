@@ -54,9 +54,6 @@ class SimilarityClusters:
             score_threshold=self.retrieved_prod_similarity_threshold,
         )
 
-        if not similar_resp or not similar_resp["hits"]["hits"]:
-            return result
-
         physical_ids = [
             hit["_source"]["product_id"]
             for hit in similar_resp["hits"]["hits"]
