@@ -1,54 +1,24 @@
 from datetime import datetime
-from typing import Dict
 
 import numpy as np
-import imagehash
 from PIL import Image
 
 from constants import constants
 from interaction import elasticsearch_db
 from similarity_clusters import SimilarityClusters
-
-
-def build_product_embedding_map(resp: Dict) -> Dict[int, np.ndarray]:
-    """
-    Build a mapping from product_id to embedding_vector_v3 (as numpy array).
-
-    Skips records where embedding_vector_v3 is None or missing.
-    """
-
-    result: Dict[int, np.ndarray] = {}
-
-    hits = resp["hits"]["hits"]
-    for hit in hits:
-        src = hit["_source"]
-        product_id = src.get("product_id")
-        emb = src.get("embedding_vector_v3")
-
-        if product_id is None or emb is None:
-            continue
-
-        result[product_id] = np.array(emb, dtype=np.float32)
-
-    return result
-
-def extract_feature_v3(image):
-    image_hash = imagehash.phash(image, hash_size=32)
-    hash_str = image_hash.__str__()
-    hash_vector = np.array([int(b) for b in bin(int(hash_str, 16))[2:].zfill(64)], dtype=np.float32)
-    hash_vector = hash_vector / np.linalg.norm(hash_vector)
-    return hash_vector
-
+from two_way_response_utils import (build_product_embedding_map,
+                                    extract_feature_v3,
+                                    unique_vectors_by_similarity)
 
 if __name__ == "__main__":
 
     similarity_clusters = SimilarityClusters(elasticsearch_db)
-    disliked_phys_ids = {(1303, datetime.now())}
+    disliked_phys_ids = {(1303, datetime.now()), (1229, datetime.now())}
     company_id = 1
-    
+
     image = Image.open("./2. 少し雑.jpg")
     image_phash = extract_feature_v3(image)
-    
+
     # ---- Two-Way Response START ----
     disliked_info_response = elasticsearch_db.find(
         indice_name=constants.ELASTICSEARCH_PREFIX,
@@ -64,7 +34,9 @@ if __name__ == "__main__":
                             }
                         },
                         {"term": {"organization_id": company_id}},
-                        {"term": {"version": "v3"}},
+                        {
+                            "term": {"version": "v3"}
+                        },  # Currently, only assume 2D is disliked
                     ]
                 }
             }
@@ -72,7 +44,7 @@ if __name__ == "__main__":
     )
 
     disliked_phashes = build_product_embedding_map(disliked_info_response)
-    
+
     print(f"disliked_phashes: {disliked_phashes}")
 
     # Create A's cluster and find all similar images and put them in
@@ -84,13 +56,22 @@ if __name__ == "__main__":
 
     # Create documents for disliked physical_ids
     # Put the A cluster in as "disliked_cluster_ids"
+    phys_ids = list(disliked_phashes.keys())
+    vectors = np.array(list(disliked_phashes.values()))
 
-    # TODO: Handle the case where disliked_phashes are similar
-    for key, val in disliked_phashes.items():
+    unique_vectors, keep_indices = unique_vectors_by_similarity(vectors)
+
+    # Rebuild dict with only unique ones
+    unique_disliked_phashes = {phys_ids[i]: vectors[i] for i in keep_indices}
+
+    # TODO 2-way response: Dont create duplicate document
+    for key, val in unique_disliked_phashes.items():
         new_doc = {
             "phash_2d": val,
             "type": "2d",
-            "disliked_cluster_ids": [cluster_info["doc_id"]],
+            "disliked_cluster_ids": [
+                {"cluster_id": cluster_info["doc_id"], "timestamp": datetime.now()}
+            ],
             "org_id": company_id,
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
