@@ -526,19 +526,30 @@ class SimilaritySearchService:
 
         return {(pid, ts) for pid, ts in latest.items()}
 
-    def _fetch_disliked_phashes(
+    def _fetch_disliked_representation_embeddings(
         self, disliked_phys_ids: Set[Tuple[int, datetime]], company_id: int
-    ) -> dict:
+    ) -> Dict[int, Dict[str, Union[str, List[float]]]]:
         """
-        Fetch 2D embeddings (phashes) for disliked physical_ids.
+        Fetch representation (2D: Phash, 3D: embedding vector) for disliked physical_ids.
+
+        Returns:
+            Dict[int, Dict[str, Any]]:
+            {physical_id: {"version": str, "embedding": list}}
         """
 
         if not disliked_phys_ids:
             return {}
 
-        resp = elasticsearch_db.find(
-            indice_name=constants.ELASTICSEARCH_PREFIX,
-            query={
+        resp = elasticsearch_db.client.search(
+            index=constants.ELASTICSEARCH_PREFIX,
+            body={
+                "size": 10000,
+                "_source": [
+                    "embedding_vector_v3",
+                    "embedding_vector_3d",
+                    "version",
+                    "product_id",
+                ],
                 "query": {
                     "bool": {
                         "filter": [
@@ -547,40 +558,85 @@ class SimilaritySearchService:
                                     "product_id": [pid for pid, _ in disliked_phys_ids]
                                 }
                             },
+                            {"terms": {"version": ["v3", "3d"]}},
                             {"term": {"organization_id": company_id}},
-                            {"term": {"version": "v3"}},
                         ]
                     }
-                }
+                },
             },
         )
 
-        return SimilaritySearchService.build_product_embedding_map(resp)
+        results = {}
+
+        hits = resp.get("hits", {}).get("hits", [])
+        for hit in hits:
+            src = hit["_source"]
+            physical_id = src["product_id"]
+            version = src["version"]
+
+            if version == "v3":
+                embedding = src.get("embedding_vector_v3")
+            elif version == "3d":
+                embedding = src.get("embedding_vector_3d")
+            else:
+                continue  # safety, should not happen due to query filter
+
+            results[physical_id] = {
+                "version": version,
+                "embedding": embedding,
+            }
+
+        return results
 
     def _update_rocchio_disliked_clusters(
-        self, disliked_phashes: dict, cluster_id: str, company_id: int
-    ):
+        self,
+        disliked_representation_embeddings: Dict[
+            int, Dict[str, Union[str, List[float]]]
+        ],
+        cluster_id: str,
+        company_id: int | str,
+    ) -> None:
         """
         Update or create Rocchio records with the disliked cluster_id.
         """
 
         now = datetime.now()
 
-        for _, phash in disliked_phashes.items():
+        for physical_id, data in disliked_representation_embeddings.items():
+            version = data["version"]
+            embedding = data["embedding"]
+
+            if version == "v3":
+                search_field = "phash_2d"
+                rocchio_type = "2d"
+            elif version == "3d":
+                search_field = "embedding_vector_3d"
+                rocchio_type = "3d"
+            else:
+                continue  # safety: skip unknown version
+
             matches = self.rocchio_feedback_2d.find_similar_rocchio_record(
-                query_vector=phash,
-                search_field="phash_2d",
+                query_vector=embedding,
+                search_field=search_field,
                 check_and_create=True,
                 filters=[
-                    {"term": {"type": "2d"}},
+                    {"term": {"type": rocchio_type}},
                     {"term": {"org_id": company_id}},
                 ],
             )
 
-            if matches.get("doc_id"):
-                self._update_existing_rocchio_doc(matches["doc_id"], cluster_id, now)
+            doc_id = matches.get("doc_id")
+
+            if doc_id:
+                self._update_existing_rocchio_doc(doc_id, cluster_id, now)
             else:
-                self._create_new_rocchio_doc(phash, cluster_id, company_id, now)
+                self._create_new_rocchio_doc(
+                    representation_embedding=embedding,
+                    version=version,
+                    cluster_id=cluster_id,
+                    company_id=company_id,
+                    timestamp=now,
+                )
 
     def _update_existing_rocchio_doc(
         self, doc_id: str, cluster_id: str, timestamp: datetime
@@ -630,18 +686,28 @@ class SimilaritySearchService:
 
     def _create_new_rocchio_doc(
         self,
-        phash: np.ndarray,
+        representation_embedding: np.ndarray,
+        version: str,
         cluster_id: str,
         company_id: int | str,
         timestamp: datetime,
-    ):
+    ) -> None:
         """
-        Create a new Rocchio document for a disliked 2D embedding.
+        Create a new Rocchio document for a disliked embedding (v3 + 3d).
         """
 
+        if version == "v3":
+            embedding_field = "phash_2d"
+            rocchio_type = "2d"
+        elif version == "3d":
+            embedding_field = "embedding_vector_3d"
+            rocchio_type = "3d"
+        else:
+            raise ValueError(f"Unsupported version: {version}")
+
         doc = {
-            "phash_2d": phash,
-            "type": "2d",
+            embedding_field: representation_embedding,
+            "type": rocchio_type,
             "disliked_cluster_ids": [
                 {"cluster_id": cluster_id, "timestamp": timestamp}
             ],
@@ -699,9 +765,11 @@ class SimilaritySearchService:
             disliked_from_clusters | disliked_from_feedback
         )
 
-        # ---- Step 3: Fetch embeddings (2D) ----
-        disliked_phashes = self._fetch_disliked_phashes(
-            merged_disliked_phys_ids, company_id
+        # ---- Step 3: Fetch embeddings (2D + 3D) ----
+        disliked_representation_embeddings = (
+            self._fetch_disliked_representation_embeddings(
+                merged_disliked_phys_ids, company_id
+            )
         )
 
         # ---- Step 4: Find cluster for current image ----
@@ -713,7 +781,7 @@ class SimilaritySearchService:
 
         # ---- Step 5: Update Rocchio docs ----
         self._update_rocchio_disliked_clusters(
-            disliked_phashes, cluster_info["doc_id"], company_id
+            disliked_representation_embeddings, cluster_info["doc_id"], company_id
         )
 
         # ---- Step 6: Apply disliked drawings to final result ----
