@@ -467,6 +467,266 @@ class SimilaritySearchService:
 
         return result
 
+    def _collect_disliked_from_clusters(self, matches: dict, company_id: int) -> set:
+        """
+        Retrieve disliked physical_ids from disliked clusters.
+
+        Returns a set of (physical_id, timestamp) extracted from cluster documents.
+        """
+
+        disliked = set()
+
+        if not matches.get("disliked_cluster_ids"):
+            return disliked
+
+        cluster_id_to_ts = {
+            item["cluster_id"]: datetime.fromisoformat(item["timestamp"])
+            for item in matches["disliked_cluster_ids"]
+        }
+
+        query = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"ids": {"values": list(cluster_id_to_ts.keys())}},
+                        {"term": {"org_id": company_id}},
+                    ]
+                }
+            },
+            "_source": ["physical_ids"],
+        }
+
+        self.similarity_clusters._ensure_existence()
+
+        resp = elasticsearch_db.client.search(
+            index=constants.SIMILARITY_CLUSTERS,
+            body=query,
+            size=len(cluster_id_to_ts),
+        )
+
+        for hit in resp["hits"]["hits"]:
+            ts = cluster_id_to_ts.get(hit["_id"])
+            for phys_id in hit["_source"].get("physical_ids", []):
+                disliked.add((phys_id, ts))
+
+        return disliked
+
+    @staticmethod
+    def merge_latest_by_phys_id(
+        phys_id_ts_pairs: Set[Tuple[int, datetime]],
+    ) -> Set[Tuple[int, datetime]]:
+        """
+        Deduplicate (physical_id, timestamp) pairs by keeping the newest timestamp.
+        """
+        latest = {}
+
+        for phys_id, ts in phys_id_ts_pairs:
+            if phys_id not in latest or ts > latest[phys_id]:
+                latest[phys_id] = ts
+
+        return {(pid, ts) for pid, ts in latest.items()}
+
+    def _fetch_disliked_phashes(
+        self, disliked_phys_ids: Set[Tuple[int, datetime]], company_id: int
+    ) -> dict:
+        """
+        Fetch 2D embeddings (phashes) for disliked physical_ids.
+        """
+
+        if not disliked_phys_ids:
+            return {}
+
+        resp = elasticsearch_db.find(
+            indice_name=constants.ELASTICSEARCH_PREFIX,
+            query={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {
+                                "terms": {
+                                    "product_id": [pid for pid, _ in disliked_phys_ids]
+                                }
+                            },
+                            {"term": {"organization_id": company_id}},
+                            {"term": {"version": "v3"}},
+                        ]
+                    }
+                }
+            },
+        )
+
+        return SimilaritySearchService.build_product_embedding_map(resp)
+
+    def _update_rocchio_disliked_clusters(
+        self, disliked_phashes: dict, cluster_id: str, company_id: int
+    ):
+        """
+        Update or create Rocchio records with the disliked cluster_id.
+        """
+
+        now = datetime.now()
+
+        for _, phash in disliked_phashes.items():
+            matches = self.rocchio_feedback_2d.find_similar_rocchio_record(
+                query_vector=phash,
+                search_field="phash_2d",
+                check_and_create=True,
+                filters=[
+                    {"term": {"type": "2d"}},
+                    {"term": {"org_id": company_id}},
+                ],
+            )
+
+            if matches.get("doc_id"):
+                self._update_existing_rocchio_doc(matches["doc_id"], cluster_id, now)
+            else:
+                self._create_new_rocchio_doc(phash, cluster_id, company_id, now)
+
+    def _update_existing_rocchio_doc(
+        self, doc_id: str, cluster_id: str, timestamp: datetime
+    ):
+        """
+        Append a disliked cluster_id to an existing Rocchio document.
+        """
+
+        update_body = {
+            "script": {
+                "lang": "painless",
+                "source": """
+                    if (ctx._source.disliked_cluster_ids == null) {
+                        ctx._source.disliked_cluster_ids = [];
+                    }
+
+                    boolean exists = false;
+                    for (item in ctx._source.disliked_cluster_ids) {
+                        if (item.cluster_id == params.cluster_id) {
+                            exists = true;
+                            break;
+                        }
+                    }
+
+                    if (!exists) {
+                        ctx._source.disliked_cluster_ids.add([
+                            "cluster_id": params.cluster_id,
+                            "timestamp": params.timestamp
+                        ]);
+                    }
+
+                    ctx._source.updated_at = params.timestamp;
+                """,
+                "params": {
+                    "cluster_id": cluster_id,
+                    "timestamp": timestamp,
+                },
+            }
+        }
+
+        elasticsearch_db.client.update(
+            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            id=doc_id,
+            body=update_body,
+            refresh="wait_for",
+        )
+
+    def _create_new_rocchio_doc(
+        self,
+        phash: np.ndarray,
+        cluster_id: str,
+        company_id: int | str,
+        timestamp: datetime,
+    ):
+        """
+        Create a new Rocchio document for a disliked 2D embedding.
+        """
+
+        doc = {
+            "phash_2d": phash,
+            "type": "2d",
+            "disliked_cluster_ids": [
+                {"cluster_id": cluster_id, "timestamp": timestamp}
+            ],
+            "org_id": company_id,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+
+        elasticsearch_db.client.index(
+            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            document=doc,
+            refresh="wait_for",
+        )
+
+    def process_disliked_feedback_2d(
+        self,
+        final_result: pd.DataFrame,
+        project_id: int,
+        company_id: int,
+        image_phash: np.ndarray,
+        feedback_list: List,
+        show_disliked_drawings: bool,
+    ) -> pd.DataFrame:
+        """
+        Process disliked feedback (2D) and update Rocchio + final result.
+
+        This function:
+        - Collects disliked physical_ids from interactions and clusters
+        - Merges and deduplicates them by latest timestamp
+        - Finds embeddings for disliked items
+        - Updates Rocchio cluster history
+        - Applies disliked drawings to the final result
+        """
+
+        # ---- Step 0: Load disliked interactions ----
+        _, matches = self.rocchio_feedback_2d.retrieve_matches(project_id, company_id)
+
+        disliked_from_interactions = {
+            (inter["physical_id"], datetime.fromisoformat(inter["timestamp"]))
+            for inter in matches["interactions"]
+            if inter["reaction"] == -1
+        }
+
+        # ---- Step 1: Collect disliked from clusters ----
+        disliked_from_clusters = self._collect_disliked_from_clusters(
+            matches, company_id
+        )
+
+        # ---- Step 2: Merge & sync with neutral feedback ----
+        disliked_from_feedback = self.filter_and_sync_neutral_feedback_2d(
+            feedback_list, disliked_from_interactions, matches
+        )
+
+        merged_disliked_phys_ids = self.merge_latest_by_phys_id(
+            disliked_from_clusters | disliked_from_feedback
+        )
+
+        # ---- Step 3: Fetch embeddings (2D) ----
+        disliked_phashes = self._fetch_disliked_phashes(
+            merged_disliked_phys_ids, company_id
+        )
+
+        # ---- Step 4: Find cluster for current image ----
+        cluster_info = self.similarity_clusters.search_cluster(
+            vector=image_phash,
+            org_id=company_id,
+            search_field="embedding_vector_2D",
+        )
+
+        # ---- Step 5: Update Rocchio docs ----
+        self._update_rocchio_disliked_clusters(
+            disliked_phashes, cluster_info["doc_id"], company_id
+        )
+
+        # ---- Step 6: Apply disliked drawings to final result ----
+        final_result["reaction"] = 0
+        final_result = self.apply_disliked_drawings(
+            final_result,
+            merged_disliked_phys_ids,
+            company_id,
+            show_disliked_drawings,
+        )
+
+        return final_result
+
     def ranking_project_ref(
         self,
         project_id: str,
@@ -704,224 +964,13 @@ class SimilaritySearchService:
                 subset=["physical_id"], keep="first"
             ).reset_index(drop=True)
 
-            # Remove disliked drawings
-            _, matches = self.rocchio_feedback_2d.retrieve_matches(
-                project_id, company_id
-            )
-            disliked_phys_ids = set(
-                (inter["physical_id"], datetime.fromisoformat(inter["timestamp"]))
-                for inter in matches["interactions"]
-                if inter["reaction"] == -1
-            )
-
-            # Always initialize first
-            disliked_physical_ids_from_clusters = set()
-
-            # Count all the phys_ids from disliked_cluster_ids here
-            if matches.get("disliked_cluster_ids", []):
-                # Build mapping: cluster_id -> timestamp
-                cluster_id_to_ts = {
-                    cluster_info["cluster_id"]: datetime.fromisoformat(cluster_info["timestamp"])
-                    for cluster_info in matches["disliked_cluster_ids"]
-                }
-
-                disliked_cluster_ids = list(cluster_id_to_ts.keys())
-
-                query = {
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {"ids": {"values": disliked_cluster_ids}},
-                                {"term": {"org_id": company_id}},
-                            ]
-                        }
-                    },
-                    "_source": ["physical_ids"],
-                }
-
-                # Ensure index exists before searching
-                self.similarity_clusters._ensure_existence()
-
-                resp = elasticsearch_db.client.search(
-                    index=constants.SIMILARITY_CLUSTERS,
-                    body=query,
-                    size=len(disliked_cluster_ids),
-                )
-
-                for hit in resp["hits"]["hits"]:
-                    cluster_id = hit["_id"]
-                    ts = cluster_id_to_ts.get(cluster_id)
-
-                    for phys_id in hit["_source"].get("physical_ids", []):
-                        disliked_physical_ids_from_clusters.add((phys_id, ts))
-
-                # logger.warning(f"matches: {matches}, cluster_id_to_ts: {cluster_id_to_ts}")
-
-            disliked_phys_ids = self.filter_and_sync_neutral_feedback_2d(
-                feedback_list, disliked_phys_ids, matches
-            )
-
-            # Combine the disliked_physical_ids_from_clusters + disliked_phys_ids from feedback
-            combined = disliked_physical_ids_from_clusters | disliked_phys_ids
-            logger.warning(f"combined: {combined}")
-            
-            # Deduplicate by physical_id, keep newest timestamp
-            latest_by_phys_id = {}
-
-            for phys_id, ts in combined:
-                if phys_id not in latest_by_phys_id or ts > latest_by_phys_id[phys_id]:
-                    latest_by_phys_id[phys_id] = ts
-
-            # Back to Set[(physical_id, datetime)]
-            merged_disliked_phys_ids = {
-                (phys_id, ts) for phys_id, ts in latest_by_phys_id.items()
-            }
-
-            # ---- Two-Way Response START ----
-
-            # -- Step 1: Get dislikes' phases (Currently, only support 2D) --
-            disliked_info_response = elasticsearch_db.find(
-                indice_name=constants.ELASTICSEARCH_PREFIX,
-                query={
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {
-                                    "terms": {
-                                        "product_id": [
-                                            phys_id for phys_id, _ in disliked_phys_ids
-                                        ]
-                                    }
-                                },
-                                {"term": {"organization_id": company_id}},
-                                {
-                                    "term": {"version": "v3"}
-                                },  # Currently, only assume 2D is disliked
-                            ]
-                        }
-                    }
-                },
-            )
-
-            disliked_phashes = SimilaritySearchService.build_product_embedding_map(
-                disliked_info_response
-            )
-
-            # -- Step 1: End --
-
-            # -- Step 2: Get cluster info (Currently, only support 2D) --
-            cluster_info = self.similarity_clusters.search_cluster(
-                vector=image_phash,
-                org_id=company_id,
-                search_field="embedding_vector_2D",
-            )
-
-            # -- Step 2: End --
-
-            # -- Step 3: Add the cluster_id to the Rocchio documents of these dislikes (Currently, only support 2D) --
-            for key, val in disliked_phashes.items():
-                new_doc = {
-                    "phash_2d": val,
-                    "type": "2d",
-                    "disliked_cluster_ids": [
-                        {
-                            "cluster_id": cluster_info["doc_id"],
-                            "timestamp": datetime.now(),
-                        }
-                    ],
-                    "org_id": company_id,
-                    "created_at": datetime.now(),
-                    "updated_at": datetime.now(),
-                }
-
-                # From this phash, find similar document in the Rocchio index
-                # What function does this in feedback_2d.py
-
-                matches = self.rocchio_feedback_2d.find_similar_rocchio_record(
-                    query_vector=val,
-                    search_field="phash_2d",
-                    check_and_create=True,
-                    filters=[
-                        {"term": {"type": "2d"}},
-                        {"term": {"org_id": company_id}},
-                    ],
-                )
-
-                # If there is 1 match exists, use update
-                if matches.get("doc_id", None) is not None:
-                    new_cluster_id = cluster_info["doc_id"]
-                    now = datetime.now()
-
-                    update_body = {
-                        "script": {
-                            "lang": "painless",
-                            "source": """
-                                if (ctx._source.disliked_cluster_ids == null) {
-                                    ctx._source.disliked_cluster_ids = [];
-                                }
-
-                                boolean exists = false;
-                                for (item in ctx._source.disliked_cluster_ids) {
-                                    if (item.cluster_id == params.cluster_id) {
-                                        exists = true;
-                                        break;
-                                    }
-                                }
-
-                                if (!exists) {
-                                    ctx._source.disliked_cluster_ids.add([
-                                        "cluster_id": params.cluster_id,
-                                        "timestamp": params.timestamp
-                                    ]);
-                                }
-
-                                ctx._source.updated_at = params.timestamp;
-                            """,
-                            "params": {
-                                "cluster_id": new_cluster_id,
-                                "timestamp": now,
-                            },
-                        }
-                    }
-
-                    elasticsearch_db.client.update(
-                        index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-                        id=matches["doc_id"],
-                        body=update_body,
-                        refresh="wait_for",
-                    )
-
-                else:
-                    new_doc = {
-                        "phash_2d": val,
-                        "type": "2d",
-                        "disliked_cluster_ids": [
-                            {
-                                "cluster_id": cluster_info["doc_id"],
-                                "timestamp": datetime.now(),
-                            }
-                        ],
-                        "org_id": company_id,
-                        "created_at": datetime.now(),
-                        "updated_at": datetime.now(),
-                    }
-
-                    elasticsearch_db.client.index(
-                        index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-                        document=new_doc,
-                        refresh="wait_for",
-                    )
-
-            # -- Step 3: End --
-
-            # ---- Two-Way Response END ----
-
-            final_result["reaction"] = 0
-            final_result = self.apply_disliked_drawings(
-                final_result,
-                merged_disliked_phys_ids,
-                company_id,
-                show_disliked_drawings,
+            final_result = self.process_disliked_feedback_2d(
+                final_result=final_result,
+                project_id=project_id,
+                company_id=company_id,
+                image_phash=image_phash,
+                feedback_list=feedback_list,
+                show_disliked_drawings=show_disliked_drawings,
             )
 
             return (
