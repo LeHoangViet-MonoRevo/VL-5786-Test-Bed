@@ -721,8 +721,8 @@ class SimilaritySearchService:
             if matches.get("disliked_cluster_ids", []):
                 # Build mapping: cluster_id -> timestamp
                 cluster_id_to_ts = {
-                    cluster_doc_id: ts
-                    for (cluster_doc_id, ts) in matches["disliked_cluster_ids"]
+                    cluster_info["cluster_id"]: datetime.fromisoformat(cluster_info["timestamp"])
+                    for cluster_info in matches["disliked_cluster_ids"]
                 }
 
                 disliked_cluster_ids = list(cluster_id_to_ts.keys())
@@ -755,13 +755,16 @@ class SimilaritySearchService:
                     for phys_id in hit["_source"].get("physical_ids", []):
                         disliked_physical_ids_from_clusters.add((phys_id, ts))
 
+                # logger.warning(f"matches: {matches}, cluster_id_to_ts: {cluster_id_to_ts}")
+
             disliked_phys_ids = self.filter_and_sync_neutral_feedback_2d(
                 feedback_list, disliked_phys_ids, matches
             )
 
             # Combine the disliked_physical_ids_from_clusters + disliked_phys_ids from feedback
             combined = disliked_physical_ids_from_clusters | disliked_phys_ids
-
+            logger.warning(f"combined: {combined}")
+            
             # Deduplicate by physical_id, keep newest timestamp
             latest_by_phys_id = {}
 
@@ -921,12 +924,9 @@ class SimilaritySearchService:
                 show_disliked_drawings,
             )
 
-            return final_result[["physical_id", "score", "parent", "reaction"]].to_dict(
-                "records"
-            ), final_result[
-                ["physical_id", "score", "parent", "version", "reaction"]
-            ].to_dict(
-                "records"
+            return (
+                final_result[["physical_id", "score", "parent", "reaction"]],
+                final_result[["physical_id", "score", "parent", "version", "reaction"]],
             )
 
         except Exception as e:
@@ -958,19 +958,19 @@ if __name__ == "__main__":
 
     similarity_search_service = SimilaritySearchService()
 
-    project_id = "1770541252583"
+    project_id = "1770545102104"
     company_id = "1"
     ocr_result = DummyOCRResult()
     basic_info_metadata = get_diagram_ocr_physical_types(company_id)
     feedback_list = [
+        (271558, 0),
         (1266, 0),
         (1265, 0),
-        (414, 0),
         (1626, 0),
         (265798, 0),
+        (414, 0),
         (82, 0),
         (9009, 0),
-        (616, 0),
         (21, 0),
         (1146, 0),
         (1070, 0),
