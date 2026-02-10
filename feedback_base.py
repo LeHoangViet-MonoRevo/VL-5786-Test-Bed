@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -127,10 +127,6 @@ class RocchioFeedbackBase:
     ) -> Optional[dict]:
         """
         Search for a similar Rocchio record and return its stored 2D/3D vectors.
-
-        Returns:
-            None -> no similar record
-            dict -> contains pos/neg vectors and doc_id
         """
 
         if check_and_create:
@@ -162,6 +158,7 @@ class RocchioFeedbackBase:
                 "interactions",
                 "disliked_cluster_ids",
             ],
+            score_threshold=self.similarity_threshold,
         )
 
         # No hits at all
@@ -200,7 +197,7 @@ class RocchioFeedbackBase:
 
         if "interactions" in source:
             result["interactions"] = source["interactions"]
-            
+
         if "disliked_cluster_ids" in source:
             result["disliked_cluster_ids"] = source["disliked_cluster_ids"]
 
@@ -265,3 +262,61 @@ class RocchioFeedbackBase:
             if reaction != 0
             and not (reaction == -1 and physical_id in past_negative_ids)
         ]
+
+    def fetch_representation_embeddings_from_raijin_search_indexer(
+        self, physical_ids: List, company_id: int
+    ) -> Dict[int, Dict[str, Union[str, List[float]]]]:
+        """
+        Fetch representation (2D: Phash, 3D: embedding vector) for disliked physical_ids.
+
+        Returns:
+            Dict[int, Dict[str, Any]]:
+            {physical_id: {"version": str, "embedding": list}}
+        """
+
+        if not physical_ids:
+            return {}
+
+        resp = self.elasticsearch_db.client.search(
+            index=constants.ELASTICSEARCH_PREFIX,
+            body={
+                "size": 10000,
+                "_source": [
+                    "embedding_vector_v3",
+                    "embedding_vector_3d",
+                    "version",
+                    "product_id",
+                ],
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"terms": {"product_id": physical_ids}},
+                            {"terms": {"version": ["v3", "3d"]}},
+                            {"term": {"organization_id": company_id}},
+                        ]
+                    }
+                },
+            },
+        )
+
+        results = {}
+
+        hits = resp.get("hits", {}).get("hits", [])
+        for hit in hits:
+            src = hit["_source"]
+            physical_id = src["product_id"]
+            version = src["version"]
+
+            if version == "v3":
+                embedding = src.get("embedding_vector_v3")
+            elif version == "3d":
+                embedding = src.get("embedding_vector_3d")
+            else:
+                continue  # safety, should not happen due to query filter
+
+            results[physical_id] = {
+                "version": version,
+                "embedding": embedding,
+            }
+
+        return results

@@ -124,19 +124,19 @@ class ESConstant:
     SCHEMA_SIMILARITY_CLUSTERS = {
         "mappings": {
             "properties": {
-                "embedding_vector_2D": {
+                "embedding_vector_2d": {
                     "type": "dense_vector",
                     "dims": constants.FEATURE_EXTRACT_DIMS_DICT[
                         constants.MODEL_EXTRACTION_NAME_V3
                     ],
                 },
-                "embedding_vector_3D": {
+                "embedding_vector_3d": {
                     "type": "dense_vector",
                     "dims": constants.FEATURE_EXTRACT_DIMS_DICT[
                         constants.ELASTICSEARCH_EXTRACTION_MODEL
                     ],
                 },
-                "type": {"type": "keyword"},  # "2d" or "3d"
+                "version": {"type": "keyword"},  # "v3" or "3d"
                 "physical_ids": {
                     "type": "keyword"
                 },  # supports int or str; ES arrays are implicit
