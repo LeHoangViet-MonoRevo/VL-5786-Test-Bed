@@ -134,7 +134,11 @@ class SimilaritySearchService:
             model_name=constants.MODEL_EXTRACTION_NAME
         )
         self.rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
-        self.similarity_clusters = SimilarityClusters(elasticsearch_db)
+        self.similarity_clusters_2d = SimilarityClusters(
+            elasticsearch_db=elasticsearch_db,
+            product_search_field="embedding_vector_v3",
+            product_version="v3",
+        )
 
     def check_production_info(self, word):
         probabilities = self.model_text_classification.predict_proba([word])
@@ -496,7 +500,7 @@ class SimilaritySearchService:
             "_source": ["physical_ids"],
         }
 
-        self.similarity_clusters._ensure_existence()
+        self.similarity_clusters_2d._ensure_existence()
 
         resp = elasticsearch_db.client.search(
             index=constants.SIMILARITY_CLUSTERS,
@@ -773,7 +777,7 @@ class SimilaritySearchService:
         )
 
         # ---- Step 4: Find cluster for current image ----
-        cluster_info = self.similarity_clusters.search_cluster(
+        cluster_info = self.similarity_clusters_2d.search_cluster(
             vector=image_phash,
             org_id=company_id,
             search_field="embedding_vector_2D",

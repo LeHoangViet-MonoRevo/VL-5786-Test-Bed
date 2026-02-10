@@ -11,14 +11,17 @@ class SimilarityClusters:
         elasticsearch_db: ElasticsearchBase,
         cluster_similarity_threshold: float = 0.98,
         retrieved_prod_similarity_threshold: float = 0.8,
+        product_search_field: str = "embedding_vector_v3",
+        product_version: str = "v3",
     ):
         self.elasticsearch_db = elasticsearch_db
         self.cluster_similarity_threshold = cluster_similarity_threshold
         self.retrieved_prod_similarity_threshold = retrieved_prod_similarity_threshold
+        self.product_search_field = product_search_field
+        self.product_version = product_version
 
     def _ensure_existence(self):
         """Ensure the similarity clusters index exists (create if missing)."""
-
         self.elasticsearch_db.check_indice_existance(
             indice_name=Constants.SIMILARITY_CLUSTERS,
             create=True,
@@ -29,11 +32,16 @@ class SimilarityClusters:
         self,
         vector,
         org_id: int | str,
+        search_field: str | None = None,
+        version: str | None = None,
     ) -> Dict:
         """
         Create a new similarity cluster from a vector by retrieving
         similar product IDs and storing them in a new document.
         """
+
+        search_field = search_field or self.product_search_field
+        version = version or self.product_version
 
         result = {
             "doc_id": None,
@@ -45,19 +53,21 @@ class SimilarityClusters:
             indice_name=Constants.ELASTICSEARCH_PREFIX,
             query_vector=vector,
             number_retrieval_vector=10000,
-            search_field="embedding_vector_v3",
+            search_field=search_field,
             filters=[
                 {"term": {"organization_id": org_id}},
-                {"term": {"version": "v3"}},
+                {"term": {"version": version}},
             ],
             selected_cols=["product_id"],
             score_threshold=self.retrieved_prod_similarity_threshold,
         )
 
+        hits = (similar_resp or {}).get("hits", {}).get("hits", [])
+
         physical_ids = [
             hit["_source"]["product_id"]
-            for hit in similar_resp["hits"]["hits"]
-            if "product_id" in hit["_source"]
+            for hit in hits
+            if "product_id" in hit.get("_source", {})
         ]
 
         doc_body = {
@@ -82,12 +92,13 @@ class SimilarityClusters:
         vector,
         org_id: int | str,
         search_field: str,
+        product_search_field: str | None = None,
+        product_version: str | None = None,
     ) -> Dict:
         """
         Find an existing cluster for the vector, or create one if none exists.
         """
 
-        # Step 1: Make sure the index exists
         self._ensure_existence()
 
         result = {
@@ -96,34 +107,32 @@ class SimilarityClusters:
             "physical_ids": None,
         }
 
-        # Step 2: Use the vector to search for the identical document.
-
         resp = self.elasticsearch_db.search_vector_w_filters(
             indice_name=Constants.SIMILARITY_CLUSTERS,
             query_vector=vector,
             number_retrieval_vector=1,
-            search_field=search_field,  # "embedding_vector_2D" or "embedding_vector_3D"
+            search_field=search_field,
             filters=[{"term": {"org_id": org_id}}],
             selected_cols=["physical_ids"],
             vector_method="l2",
             score_threshold=self.cluster_similarity_threshold,
         )
 
-        # No hits at all
         if not resp or not resp["hits"]["hits"]:
-            return self._create_cluster_from_vector(vector=vector, org_id=org_id)
+            return self._create_cluster_from_vector(
+                vector=vector,
+                org_id=org_id,
+                search_field=product_search_field,
+                version=product_version,
+            )
 
         es_hit = resp["hits"]["hits"][0]
-
         source = es_hit["_source"]
 
-        # Extract vectors if exist
         result["doc_id"] = es_hit["_id"]
         result["similarity_score"] = es_hit["_score"]
 
         if "physical_ids" in source:
             result["physical_ids"] = source["physical_ids"]
-
-        # Step 2: Return the dictionary containing the result.
 
         return result
