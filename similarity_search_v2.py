@@ -135,9 +135,7 @@ class SimilaritySearchService:
         )
         self.rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
         self.similarity_clusters_2d = SimilarityClusters(
-            elasticsearch_db=elasticsearch_db,
-            product_search_field="embedding_vector_v3",
-            product_version="v3",
+            elasticsearch_db=elasticsearch_db, mode="2d"
         )
 
     def check_production_info(self, word):
@@ -780,7 +778,6 @@ class SimilaritySearchService:
         cluster_info = self.similarity_clusters_2d.search_cluster(
             vector=image_phash,
             org_id=company_id,
-            search_field="embedding_vector_2D",
         )
 
         # ---- Step 5: Update Rocchio docs ----
