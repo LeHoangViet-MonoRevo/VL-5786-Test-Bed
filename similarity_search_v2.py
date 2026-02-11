@@ -179,7 +179,11 @@ class SimilaritySearchService:
             return None
 
         list_query_vector = self.rocchio_feedback_2d.run(
-            list_query_vector, project_id, company_id, indice_name, feedback_list
+            query_vectors=list_query_vector,
+            project_id=project_id,
+            org_id=company_id,
+            embedding_index=indice_name,
+            feedback_list=feedback_list,
         )
 
         result_similarity = pd.DataFrame()
@@ -383,45 +387,10 @@ class SimilaritySearchService:
         )
         return df.sort_values("datetime", ascending=False).reset_index(drop=True)
 
-    def filter_and_sync_neutral_feedback_2d(
-        self,
-        feedback_list: List[Tuple[Any, int]],
-        disliked_phys_ids: Set[Tuple[int, datetime]],
-        matches: Dict,
-    ) -> Set[Tuple[int, datetime]]:
-        """
-        Remove neutralised dislikes and sync changes to Elasticsearch.
-        """
-
-        # Step 1: find neutral physical_ids in feedback_list
-        neutral_phys_ids = {
-            phys_id for phys_id, reaction in feedback_list if reaction == 0
-        }
-
-        # Step 1.5: Find disliked items that are now neutral
-        neutral_in_disliked = {
-            (phys_id, ts)
-            for phys_id, ts in disliked_phys_ids
-            if phys_id in neutral_phys_ids
-        }
-
-        # Step 2: Remove neutral from disliked_phys_ids
-        if neutral_in_disliked:
-            disliked_phys_ids -= neutral_in_disliked
-
-            # Step 3: update ES (remove from interactions)
-            self.rocchio_feedback_2d.remove_interactions_by_physical_ids(
-                constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-                doc_id=matches["doc_id"],
-                physical_ids=[physical_id for (physical_id, _) in neutral_in_disliked],
-            )
-
-        return disliked_phys_ids
-
     @staticmethod
     def apply_disliked_drawings(
         final_result: pd.DataFrame,
-        disliked_phys_ids: Set,
+        disliked_phys_ids: Set[Tuple[int, datetime]],
         company_id: int,
         show_disliked_drawings: bool,
     ) -> pd.DataFrame:
@@ -447,73 +416,6 @@ class SimilaritySearchService:
         return pd.concat([filtered, disliked_df], ignore_index=True)
 
     @staticmethod
-    def build_product_embedding_map(resp: Dict) -> Dict[int, np.ndarray]:
-        """
-        Build a mapping from product_id to embedding_vector_v3 (as numpy array).
-
-        Skips records where embedding_vector_v3 is None or missing.
-        """
-
-        result: Dict[int, np.ndarray] = {}
-
-        hits = resp["hits"]["hits"]
-        for hit in hits:
-            src = hit["_source"]
-            product_id = src.get("product_id")
-            emb = src.get("embedding_vector_v3")
-
-            if product_id is None or emb is None:
-                continue
-
-            result[product_id] = np.array(emb, dtype=np.float32)
-
-        return result
-
-    def _collect_disliked_from_clusters(self, matches: dict, company_id: int) -> set:
-        """
-        Retrieve disliked physical_ids from disliked clusters.
-
-        Returns a set of (physical_id, timestamp) extracted from cluster documents.
-        """
-
-        disliked = set()
-
-        if not matches.get("disliked_cluster_ids"):
-            return disliked
-
-        cluster_id_to_ts = {
-            item["cluster_id"]: datetime.fromisoformat(item["timestamp"])
-            for item in matches["disliked_cluster_ids"]
-        }
-
-        query = {
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"ids": {"values": list(cluster_id_to_ts.keys())}},
-                        {"term": {"org_id": company_id}},
-                    ]
-                }
-            },
-            "_source": ["physical_ids"],
-        }
-
-        self.similarity_clusters_2d._ensure_existence()
-
-        resp = elasticsearch_db.client.search(
-            index=constants.SIMILARITY_CLUSTERS,
-            body=query,
-            size=len(cluster_id_to_ts),
-        )
-
-        for hit in resp["hits"]["hits"]:
-            ts = cluster_id_to_ts.get(hit["_id"])
-            for phys_id in hit["_source"].get("physical_ids", []):
-                disliked.add((phys_id, ts))
-
-        return disliked
-
-    @staticmethod
     def merge_latest_by_phys_id(
         phys_id_ts_pairs: Set[Tuple[int, datetime]],
     ) -> Set[Tuple[int, datetime]]:
@@ -528,273 +430,72 @@ class SimilaritySearchService:
 
         return {(pid, ts) for pid, ts in latest.items()}
 
-    def _fetch_disliked_representation_embeddings(
-        self, disliked_phys_ids: Set[Tuple[int, datetime]], company_id: int
-    ) -> Dict[int, Dict[str, Union[str, List[float]]]]:
-        """
-        Fetch representation (2D: Phash, 3D: embedding vector) for disliked physical_ids.
-
-        Returns:
-            Dict[int, Dict[str, Any]]:
-            {physical_id: {"version": str, "embedding": list}}
-        """
-
-        if not disliked_phys_ids:
-            return {}
-
-        resp = elasticsearch_db.client.search(
-            index=constants.ELASTICSEARCH_PREFIX,
-            body={
-                "size": 10000,
-                "_source": [
-                    "embedding_vector_v3",
-                    "embedding_vector_3d",
-                    "version",
-                    "product_id",
-                ],
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {
-                                "terms": {
-                                    "product_id": [pid for pid, _ in disliked_phys_ids]
-                                }
-                            },
-                            {"terms": {"version": ["v3", "3d"]}},
-                            {"term": {"organization_id": company_id}},
-                        ]
-                    }
-                },
-            },
-        )
-
-        results = {}
-
-        hits = resp.get("hits", {}).get("hits", [])
-        for hit in hits:
-            src = hit["_source"]
-            physical_id = src["product_id"]
-            version = src["version"]
-
-            if version == "v3":
-                embedding = src.get("embedding_vector_v3")
-            elif version == "3d":
-                embedding = src.get("embedding_vector_3d")
-            else:
-                continue  # safety, should not happen due to query filter
-
-            results[physical_id] = {
-                "version": version,
-                "embedding": embedding,
-            }
-
-        return results
-
-    def _update_rocchio_disliked_clusters(
+    def process_dislikes_2d(
         self,
-        disliked_representation_embeddings: Dict[
-            int, Dict[str, Union[str, List[float]]]
-        ],
-        cluster_id: str,
-        company_id: int | str,
-    ) -> None:
-        """
-        Update or create Rocchio records with the disliked cluster_id.
-        """
-
-        now = datetime.now()
-
-        for physical_id, data in disliked_representation_embeddings.items():
-            version = data["version"]
-            embedding = data["embedding"]
-
-            if version == "v3":
-                search_field = "phash_2d"
-                rocchio_type = "2d"
-            elif version == "3d":
-                search_field = "embedding_vector_3d"
-                rocchio_type = "3d"
-            else:
-                continue  # safety: skip unknown version
-
-            matches = self.rocchio_feedback_2d.find_similar_rocchio_record(
-                query_vector=embedding,
-                search_field=search_field,
-                check_and_create=True,
-                filters=[
-                    {"term": {"type": rocchio_type}},
-                    {"term": {"org_id": company_id}},
-                ],
-            )
-
-            doc_id = matches.get("doc_id")
-
-            if doc_id:
-                self._update_existing_rocchio_doc(doc_id, cluster_id, now)
-            else:
-                self._create_new_rocchio_doc(
-                    representation_embedding=embedding,
-                    version=version,
-                    cluster_id=cluster_id,
-                    company_id=company_id,
-                    timestamp=now,
-                )
-
-    def _update_existing_rocchio_doc(
-        self, doc_id: str, cluster_id: str, timestamp: datetime
-    ):
-        """
-        Append a disliked cluster_id to an existing Rocchio document.
-        """
-
-        update_body = {
-            "script": {
-                "lang": "painless",
-                "source": """
-                    if (ctx._source.disliked_cluster_ids == null) {
-                        ctx._source.disliked_cluster_ids = [];
-                    }
-
-                    boolean exists = false;
-                    for (item in ctx._source.disliked_cluster_ids) {
-                        if (item.cluster_id == params.cluster_id) {
-                            exists = true;
-                            break;
-                        }
-                    }
-
-                    if (!exists) {
-                        ctx._source.disliked_cluster_ids.add([
-                            "cluster_id": params.cluster_id,
-                            "timestamp": params.timestamp
-                        ]);
-                    }
-
-                    ctx._source.updated_at = params.timestamp;
-                """,
-                "params": {
-                    "cluster_id": cluster_id,
-                    "timestamp": timestamp,
-                },
-            }
-        }
-
-        elasticsearch_db.client.update(
-            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-            id=doc_id,
-            body=update_body,
-            refresh="wait_for",
-        )
-
-    def _create_new_rocchio_doc(
-        self,
-        representation_embedding: np.ndarray,
-        version: str,
-        cluster_id: str,
-        company_id: int | str,
-        timestamp: datetime,
-    ) -> None:
-        """
-        Create a new Rocchio document for a disliked embedding (v3 + 3d).
-        """
-
-        if version == "v3":
-            embedding_field = "phash_2d"
-            rocchio_type = "2d"
-        elif version == "3d":
-            embedding_field = "embedding_vector_3d"
-            rocchio_type = "3d"
-        else:
-            raise ValueError(f"Unsupported version: {version}")
-
-        doc = {
-            embedding_field: representation_embedding,
-            "type": rocchio_type,
-            "disliked_cluster_ids": [
-                {"cluster_id": cluster_id, "timestamp": timestamp}
-            ],
-            "org_id": company_id,
-            "created_at": timestamp,
-            "updated_at": timestamp,
-        }
-
-        elasticsearch_db.client.index(
-            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-            document=doc,
-            refresh="wait_for",
-        )
-
-    def process_disliked_feedback_2d(
-        self,
-        final_result: pd.DataFrame,
+        result: pd.DataFrame,
         project_id: int,
         company_id: int,
-        image_phash: np.ndarray,
-        feedback_list: List,
         show_disliked_drawings: bool,
     ) -> pd.DataFrame:
-        """
-        Process disliked feedback (2D) and update Rocchio + final result.
+        """Add later"""
 
-        This function:
-        - Collects disliked physical_ids from interactions and clusters
-        - Merges and deduplicates them by latest timestamp
-        - Finds embeddings for disliked items
-        - Updates Rocchio cluster history
-        - Applies disliked drawings to the final result
-        """
+        # Step 1: Retrive the exact match from ROCCHIO index
+        _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
+            project_id, company_id
+        )
 
-        # ---- Step 0: Load disliked interactions ----
-        _, matches = self.rocchio_feedback_2d.retrieve_matches(project_id, company_id)
+        # Step 2: Get all disliked_cluster_ids from match
+        disliked_cluster_info = match.get("disliked_cluster_ids", [])
 
-        disliked_from_interactions = {
-            (inter["physical_id"], datetime.fromisoformat(inter["timestamp"]))
-            for inter in matches["interactions"]
-            if inter["reaction"] == -1
+        # Build cluster_id -> timestamp map (ONE timestamp per cluster)
+        cluster_timestamp_map = {
+            info["cluster_id"]: datetime.fromisoformat(info["timestamp"])
+            for info in disliked_cluster_info
+            if "cluster_id" in info and "timestamp" in info
         }
 
-        # ---- Step 1: Collect disliked from clusters ----
-        disliked_from_clusters = self._collect_disliked_from_clusters(
-            matches, company_id
+        if not cluster_timestamp_map:
+            return result
+
+        # Fetch clusters from similarity_clusters
+        resp = elasticsearch_db.client.mget(
+            index=constants.SIMILARITY_CLUSTERS,
+            body={"ids": list(cluster_timestamp_map.keys())},
         )
 
-        # ---- Step 2: Merge & sync with neutral feedback ----
-        disliked_from_feedback = self.filter_and_sync_neutral_feedback_2d(
-            feedback_list, disliked_from_interactions, matches
+        # Step 3: Get the "neutralisations"
+        neutralisations = match.get("neutralisations", [])
+
+        neutralised_physical_ids = {
+            n["physical_id"] for n in neutralisations if "physical_id" in n
+        }
+
+        # Step 4: Combine disliked clusters + neutralisations
+        # Build Set[(physical_id, timestamp)]
+        disliked_phys_ids: Set[Tuple[int, datetime]] = set()
+
+        for doc in resp.get("docs", []):
+            if not doc.get("found"):
+                continue
+
+            cluster_id = doc["_id"]
+            cluster_timestamp = cluster_timestamp_map.get(cluster_id)
+
+            for pid in doc.get("_source", {}).get("physical_ids", []):
+                if pid in neutralised_physical_ids:
+                    continue  # neutralised → skip
+                disliked_phys_ids.add((pid, cluster_timestamp))
+
+        # Step 5: Apply the disliked handler
+        result["reaction"] = 0
+        result = self.apply_disliked_drawings(
+            final_result=result,
+            disliked_phys_ids=disliked_phys_ids,
+            company_id=company_id,
+            show_disliked_drawings=show_disliked_drawings,
         )
 
-        merged_disliked_phys_ids = self.merge_latest_by_phys_id(
-            disliked_from_clusters | disliked_from_feedback
-        )
-
-        # ---- Step 3: Fetch embeddings (2D + 3D) ----
-        disliked_representation_embeddings = (
-            self._fetch_disliked_representation_embeddings(
-                merged_disliked_phys_ids, company_id
-            )
-        )
-
-        # ---- Step 4: Find cluster for current image ----
-        cluster_info = self.similarity_clusters_2d.search_cluster(
-            vector=image_phash,
-            org_id=company_id,
-        )
-
-        # ---- Step 5: Update Rocchio docs ----
-        self._update_rocchio_disliked_clusters(
-            disliked_representation_embeddings, cluster_info["doc_id"], company_id
-        )
-
-        # ---- Step 6: Apply disliked drawings to final result ----
-        final_result["reaction"] = 0
-        final_result = self.apply_disliked_drawings(
-            final_result,
-            merged_disliked_phys_ids,
-            company_id,
-            show_disliked_drawings,
-        )
-
-        return final_result
+        return result
 
     def ranking_project_ref(
         self,
@@ -1033,12 +734,10 @@ class SimilaritySearchService:
                 subset=["physical_id"], keep="first"
             ).reset_index(drop=True)
 
-            final_result = self.process_disliked_feedback_2d(
-                final_result=final_result,
+            final_result = self.process_dislikes_2d(
+                result=final_result,
                 project_id=project_id,
                 company_id=company_id,
-                image_phash=image_phash,
-                feedback_list=feedback_list,
                 show_disliked_drawings=show_disliked_drawings,
             )
 
