@@ -411,7 +411,7 @@ class RocchioFeedbackBase:
             search_field=embedding_field,
             filters=[
                 {"term": {"org_id": org_id}},
-                {"term": {"type": version}},
+                {"term": {"version": version}},
             ],
             selected_cols=["physical_ids"],
             vector_method="l2",
