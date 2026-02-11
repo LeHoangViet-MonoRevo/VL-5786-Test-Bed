@@ -659,6 +659,12 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             body=es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT,
         )
 
+        neutral_feedback_list = [
+            (physical_id, reaction)
+            for physical_id, reaction in feedback_list
+            if reaction == 0
+        ]
+
         # Step 0: Filter neutral feedback
         feedback_list = self._filter_feedback(feedback_list)
 
@@ -700,5 +706,98 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             host_cluster_id=host_cluster_id["doc_id"],
             org_id=org_id,
         )
+
+        # Step 5: Handle neutralisations
+
+        print(f"match: {match}")
+        print(f"neutral_feedback_list: {neutral_feedback_list}")
+
+        if match.get("doc_id", None) is not None:
+            host_doc_id = match["doc_id"]
+
+            # 1. Fetch the current neutralisations
+            existing_neutralisations = match.get("neutralisations", [])
+            existing_neutral_map = {
+                n["physical_id"]: n for n in existing_neutralisations
+            }
+
+            # Build set of currently disliked physical_ids
+            disliked_physical_ids = set()
+            for info in combined_disliked_clusters.values():
+                for pid in info.get("physical_ids", []):
+                    disliked_physical_ids.add(pid)
+
+            now = datetime.now()
+
+            # 2. If items in neutral_feedback_list cross with disliked_physical_ids
+            # -> add them to new_neutralisations
+            for physical_id, _ in neutral_feedback_list:
+                if physical_id in disliked_physical_ids:
+                    existing_neutral_map[physical_id] = {
+                        "physical_id": physical_id,
+                        "timestamp": now,
+                    }
+
+            # 3. If items in negative_feedback_list cross with existing_neutralisations
+            # -> remove them
+            negative_physical_ids = {
+                physical_id for physical_id, reaction in feedback_list if reaction == -1
+            }
+
+            for pid in negative_physical_ids:
+                if pid in existing_neutral_map:
+                    existing_neutral_map.pop(pid, None)
+
+            new_neutralisations = [
+                {"physical_id": pid, "timestamp": now}
+                for pid, _ in neutral_feedback_list
+                if pid in disliked_physical_ids
+            ]
+
+            negative_physical_ids = [
+                pid for pid, reaction in feedback_list if reaction == -1
+            ]
+
+            self.elasticsearch_db.client.update(
+                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                id=host_doc_id,
+                script={
+                    "lang": "painless",
+                    "source": """
+                                if (ctx._source.neutralisations == null) {
+                                    ctx._source.neutralisations = [];
+                                }
+
+                                // Build map for fast lookup
+                                Map existing = new HashMap();
+                                for (n in ctx._source.neutralisations) {
+                                    existing.put(n.physical_id, n);
+                                }
+
+                                // Add / update neutralisations
+                                for (n in params.to_add) {
+                                    existing.put(n.physical_id, n);
+                                }
+
+                                // Remove neutralisations if now disliked again
+                                for (pid in params.to_remove) {
+                                    existing.remove(pid);
+                                }
+
+                                // Write back
+                                ctx._source.neutralisations = new ArrayList(existing.values());
+                                ctx._source.updated_at = params.now;
+                            """,
+                    "params": {
+                        "to_add": new_neutralisations,  # [{physical_id, timestamp}, ...]
+                        "to_remove": list(negative_physical_ids),  # [physical_id, ...]
+                        "now": now,
+                    },
+                },
+            )
+
+        else:
+            # Do nothing
+            pass
 
         return query_vectors
