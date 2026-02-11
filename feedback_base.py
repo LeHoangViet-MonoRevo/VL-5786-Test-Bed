@@ -141,6 +141,7 @@ class RocchioFeedbackBase:
             "rocchio_neg_vec_2d": None,
             "interactions": [],
             "disliked_cluster_ids": [],
+            "neutralisations": [],
         }
 
         # Step 1: Find matches in ES db
@@ -157,6 +158,7 @@ class RocchioFeedbackBase:
                 "rocchio_neg_vec_3d",
                 "interactions",
                 "disliked_cluster_ids",
+                "neutralisations",
             ],
             score_threshold=self.similarity_threshold,
         )
@@ -200,6 +202,9 @@ class RocchioFeedbackBase:
 
         if "disliked_cluster_ids" in source:
             result["disliked_cluster_ids"] = source["disliked_cluster_ids"]
+        
+        if "neutralisations" in source:
+            result["neutralisations"] = source["neutralisations"]
 
         return result
 
