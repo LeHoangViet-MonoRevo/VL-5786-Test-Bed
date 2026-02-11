@@ -1,4 +1,4 @@
-from feedback_2d_cluster import RocchioFeedback2D
+from feedback_2d import RocchioFeedback2D
 from interaction import elasticsearch_db
 
 if __name__ == "__main__":
