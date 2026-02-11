@@ -372,46 +372,48 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         version: str,
         org_id: str,
     ) -> Tuple[str, Dict[str, Any]]:
-        """Search or create cluster."""
+
         embedding_field = (
-            "embedding_vector_3D" if version == "3d" else "embedding_vector_2D"
+            "embedding_vector_3d" if version == "3d" else "embedding_vector_2d"
         )
 
-        res = self.elasticsearch_db.client.search(
-            index=constants.SIMILARITY_CLUSTERS,
-            size=1,
-            query={
-                "bool": {
-                    "filter": [
-                        {"term": {"org_id": org_id}},
-                        {"term": {"type": version}},
-                    ],
-                    "must": {
-                        "knn": {
-                            "field": embedding_field,
-                            "query_vector": rep_vec,
-                            "k": 1,
-                            "num_candidates": 50,
-                        }
-                    },
-                }
-            },
+        filters = [
+            {"term": {"org_id": org_id}},
+            {"term": {"version": version}},
+        ]
+
+        res = self.elasticsearch_db.search_vector_w_filters(
+            indice_name=constants.SIMILARITY_CLUSTERS,
+            query_vector=rep_vec,
+            number_retrieval_vector=1,
+            search_field=embedding_field,
+            filters=filters,
+            vector_method="l2",  # or "l2"
+            score_threshold=self.similarity_threshold,
+            selected_cols=["physical_ids", "version"],
         )
 
-        hits = res.get("hits", {}).get("hits", [])
+        print(f"res: {res}")
 
-        if hits and hits[0]["_score"] >= self.similarity_threshold:
-            src = hits[0]["_source"]
-            cluster_id = src.get("cluster_id", hits[0]["_id"])
+        hits = res.get("hits", {}).get("hits", []) if res else []
+
+        # ✅ MATCH FOUND
+        if hits:
+            hit = hits[0]
+            src = hit["_source"]
+            cluster_id = hit["_id"]
+
             return cluster_id, {
-                "physical_ids": src["physical_ids"],
-                "embedding": np.array(src[embedding_field], dtype=np.float32),
-                "version": src.get("version"),
+                "physical_ids": src.get("physical_ids", []),
+                "embedding": rep_vec,
+                "version": src.get("version", version),
             }
 
+        # ❌ NO MATCH → CREATE
         created = self._create_cluster_from_vector(
             rep_vec, version=version, org_id=org_id
         )
+
         return created["doc_id"], {
             "physical_ids": created["physical_ids"],
             "embedding": created["embedding"],
