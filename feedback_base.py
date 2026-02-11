@@ -320,3 +320,68 @@ class RocchioFeedbackBase:
             }
 
         return results
+
+    def _create_cluster_from_vector(self, vector: List | np.ndarray,
+                                    version: str,
+                                    org_id: int | str,
+                                    ):
+        """
+        Create a new similarity cluster from a vector by retrieving
+        similar product IDs and storing them in a new document.
+        """
+        
+        if version == "v3":
+            product_search_field = "embedding_vector_v3"
+        elif version == "3d":
+            product_search_field = "embedding_vector_3d"
+        else:
+            raise ValueError(f"version: {version} is not valid!!")
+
+        similar_resp = self.elasticsearch_db.search_vector_w_filters(
+            indice_name=constants.ELASTICSEARCH_PREFIX,
+            query_vector=vector,
+            number_retrieval_vector=10000,
+            search_field=product_search_field,
+            filters=[
+                {"term": {"organization_id": org_id}},
+                {"term": {"version": version}},
+            ],
+            selected_cols=["product_id"],
+            score_threshold=self.similarity_threshold,
+        )
+        
+        hits = (similar_resp or {}).get("hits", {}).get("hits", [])
+        
+        physical_ids = [
+            hit["_source"]["product_id"]
+            for hit in hits
+            if "product_id" in hit.get("_source", {})
+        ]
+        
+        if version == "v3":
+            embedding_field = "embedding_vector_2d"
+        elif version == "3d":
+            embedding_field = "embedding_vector_3d"
+        else:
+            raise ValueError
+
+        doc_body = {
+            "version": version,
+            "org_id": org_id,
+            "physical_ids": physical_ids,
+            embedding_field: vector,
+        }
+        
+        create_resp = self.elasticsearch_db.client.index(
+            index=constants.SIMILARITY_CLUSTERS,
+            document=doc_body,
+            refresh="wait_for",
+        )
+
+        return {
+            "doc_id": create_resp["_id"],
+            "physical_ids": physical_ids,
+            "version": version,
+            "embedding": vector, 
+        }
+        
