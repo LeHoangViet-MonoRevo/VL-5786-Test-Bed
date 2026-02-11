@@ -321,15 +321,17 @@ class RocchioFeedbackBase:
 
         return results
 
-    def _create_cluster_from_vector(self, vector: List | np.ndarray,
-                                    version: str,
-                                    org_id: int | str,
-                                    ):
+    def _create_cluster_from_vector(
+        self,
+        vector: List | np.ndarray,
+        version: str,
+        org_id: int | str,
+    ):
         """
         Create a new similarity cluster from a vector by retrieving
         similar product IDs and storing them in a new document.
         """
-        
+
         if version == "v3":
             product_search_field = "embedding_vector_v3"
         elif version == "3d":
@@ -349,15 +351,15 @@ class RocchioFeedbackBase:
             selected_cols=["product_id"],
             score_threshold=self.similarity_threshold,
         )
-        
+
         hits = (similar_resp or {}).get("hits", {}).get("hits", [])
-        
+
         physical_ids = [
             hit["_source"]["product_id"]
             for hit in hits
             if "product_id" in hit.get("_source", {})
         ]
-        
+
         if version == "v3":
             embedding_field = "embedding_vector_2d"
         elif version == "3d":
@@ -371,7 +373,7 @@ class RocchioFeedbackBase:
             "physical_ids": physical_ids,
             embedding_field: vector,
         }
-        
+
         create_resp = self.elasticsearch_db.client.index(
             index=constants.SIMILARITY_CLUSTERS,
             document=doc_body,
@@ -382,6 +384,53 @@ class RocchioFeedbackBase:
             "doc_id": create_resp["_id"],
             "physical_ids": physical_ids,
             "version": version,
-            "embedding": vector, 
+            "embedding": vector,
         }
-        
+
+    def search_cluster(
+        self,
+        vector,
+        version: str,
+        org_id: int | str,
+    ) -> Dict:
+        """
+        Find an existing cluster for the vector, or create one & do clustering if none exists.
+        """
+
+        if version == "v3":
+            embedding_field = "embedding_vector_2d"
+        elif version == "3d":
+            embedding_field = "embedding_vector_3d"
+        else:
+            raise ValueError
+
+        resp = self.elasticsearch_db.search_vector_w_filters(
+            indice_name=constants.SIMILARITY_CLUSTERS,
+            query_vector=vector,
+            number_retrieval_vector=1,
+            search_field=embedding_field,
+            filters=[
+                {"term": {"org_id": org_id}},
+                {"term": {"type": version}},
+            ],
+            selected_cols=["physical_ids"],
+            vector_method="l2",
+            score_threshold=self.similarity_threshold,
+        )
+
+        if not resp or not resp["hits"]["hits"]:
+            return self._create_cluster_from_vector(
+                vector=vector,
+                version=version,
+                org_id=org_id,
+            )
+
+        es_hit = resp["hits"]["hits"][0]
+        source = es_hit["_source"]
+
+        return {
+            "doc_id": es_hit["_id"],
+            "physical_ids": source.get("physical_ids", []),
+            "version": version,
+            "embedding": source.get(embedding_field),
+        }
