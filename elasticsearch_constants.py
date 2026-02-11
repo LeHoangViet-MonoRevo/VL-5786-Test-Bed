@@ -107,6 +107,13 @@ class ESConstant:
                         "timestamp": {"type": "date"},
                     },
                 },
+                "neutralisations": {
+                    "type": "nested",
+                    "properties": {
+                        "physical_id": {"type": "integer"},
+                        "timestamp": {"type": "date"},
+                    },
+                },
                 "disliked_cluster_ids": {
                     "type": "nested",
                     "properties": {
