@@ -276,8 +276,8 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         Return:
         {
             cluster_id: {
-                "physical_id": ...,
-                "rep_emb": ...,
+                "physical_ids": ...,
+                "embedding": ...,
                 "version": ...
             }
         }
@@ -314,7 +314,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
             disliked_cluster_info[cluster_id] = {
                 "physical_ids": src["physical_ids"],
-                "rep_emb": src[emb_field],
+                "embedding": src[emb_field],
                 "version": version,
             }
 
@@ -538,19 +538,119 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         # Step 2: Get all disliked_cluster info
         disliked_cluster_info = self._load_disliked_clusters_from_match(match)
 
-        # Step 3: Forward (Update host in Rocchio + Update dislikes in similarity_clusters)
+        # Step 3: Forward (Update host in Rocchio + Update dislikes in similarity_clusters + Add disliked clusters to host in Rocchio)
         remaining_feedback = self._get_remaining_feedback(
             feedback_list, disliked_cluster_info
         )
 
         if remaining_feedback:
             print(f"remaining_feedback: {remaining_feedback}")
-            new_clusters = self._process_remaining_feedback(remaining_feedback, org_id)
+            new_disliked_clusters = self._process_remaining_feedback(
+                remaining_feedback, org_id
+            )
             self._update_or_create_host_doc(
-                match, hash_vector, new_clusters, project_id, org_id
+                match, hash_vector, new_disliked_clusters, project_id, org_id
             )
 
         # Step 4: Backward (Update dislikes in Rocchio + Append the host cluster to dislikes in Rocchio)
-        # TODO:
+
+        # For each disliked cluster -> find/create a doc in Rocchio -> Append the host cluster
+        # 1. Find the host_cluster_id (hash_vector -> search in similarity_clusters -> find/create)
+        host_cluster_id = self.search_cluster(
+            vector=hash_vector,
+            version="v3",  # Host is image
+            org_id=org_id,
+        )
+
+        # 2. for each disliked_cluster_id -> Create a rocchio record -> Append the host_cluster_id
+        # new_disliked_clusters: {"cluster_id": {"physical_ids", "embedding", "version"}}
+        # disliked_cluster_info: {"cluster_id": {"physical_ids", "embedding", "version"}}
+
+        # Combine
+        combined_disliked_clusters = {
+            **disliked_cluster_info,
+            **(new_disliked_clusters if remaining_feedback else {}),
+        }
+
+        now = datetime.now()
+
+        # Append to the host_cluster_id
+        # For each item in combined_disliked_clusters
+        for disliked_cluster_id, info in combined_disliked_clusters.items():
+            # Search in Rocchio index
+            version = info["version"]
+            if version == "v3":
+                embedding_field = "phash_2d"
+                doc_type = "2d"
+                filters = [{"term": {"type": "2d"}}, {"term": {"org_id": org_id}}]
+            elif version == "3d":
+                doc_type = "3d"
+                embedding_field = "embedding_vector_3d"
+                filters = [{"term": {"type": "3d"}}, {"term": {"org_id": org_id}}]
+            else:
+                raise ValueError(f"Unknown version: {version}")
+
+            disliked_match_in_rocchio = self.find_similar_rocchio_record(
+                query_vector=info["embedding"],
+                search_field=embedding_field,
+                check_and_create=True,
+                filters=filters,
+            )
+
+            doc_id = disliked_match_in_rocchio.get("doc_id", None)
+
+            # If exists -> Update (append the host cluster_id)
+            if doc_id is not None:
+                self.elasticsearch_db.client.update(
+                    index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                    id=doc_id,
+                    refresh="wait_for",
+                    script={
+                        "source": """
+                        if (ctx._source.disliked_cluster_ids == null) {
+                            ctx._source.disliked_cluster_ids = [];
+                        }
+
+                        boolean exists = false;
+                        for (e in ctx._source.disliked_cluster_ids) {
+                            if (e.cluster_id == params.cluster_id) {
+                                exists = true;
+                                break;
+                            }
+                        }
+
+                        if (!exists) {
+                            ctx._source.disliked_cluster_ids.add(
+                                ["cluster_id": params.cluster_id, "timestamp": params.now]
+                            );
+                        }
+
+                        ctx._source.updated_at = params.now;
+                        """,
+                        "params": {
+                            "cluster_id": host_cluster_id["doc_id"],
+                            "now": now,
+                        },
+                    },
+                )
+            else:
+                # Else -> Create new doc and append the host cluster_id
+                new_doc = {
+                    embedding_field: info["embedding"],
+                    "type": doc_type,
+                    "org_id": org_id,
+                    "disliked_cluster_ids": [
+                        {"cluster_id": host_cluster_id["doc_id"], "timestamp": now}
+                    ],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+
+                self.elasticsearch_db.client.index(
+                    index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                    document=new_doc,
+                    refresh="wait_for",
+                )
+            # Else -> Create now doc and append the host cluster_id
 
         return query_vectors
