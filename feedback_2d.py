@@ -711,7 +711,6 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         query_vectors: List[np.ndarray],
         project_id: Union[int, str],
         org_id: str,
-        embedding_index: str,
         feedback_list: List[Tuple[int, int]] = [],
     ) -> List[np.ndarray]:
         """Main Rocchio execution."""

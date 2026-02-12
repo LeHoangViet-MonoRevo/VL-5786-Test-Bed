@@ -9,7 +9,7 @@ from feedback_2d import RocchioFeedback2D
 from feedback_base import RocchioFeedbackBase
 
 
-class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
+class RocchioFeedback3D(RocchioFeedback2D):
     def __init__(self, elasticsearch_db, similarity_threshold=0.98):
         super().__init__(elasticsearch_db, similarity_threshold)
 
@@ -26,8 +26,7 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
 
         # Filter out the neutral reactions and already processed reactions
         past_interactions = [
-            (inter["physical_id"], inter["reaction"])
-            for inter in matches["interactions"]
+            (inter["physical_id"], inter["reaction"]) for inter in matches["interactions"]
         ]
         feedback_list = self.remove_neutral_and_duplicate_negative_interactions(
             feedback_list, past_interactions
@@ -50,9 +49,9 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
 
             interactions_save_in_es = self.convert_feedback_to_interactions(
                 feedback_list,
-                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"][
-                    "properties"
-                ]["interactions"]["properties"].keys(),
+                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"]["properties"][
+                    "interactions"
+                ]["properties"].keys(),
             )
 
             # Save the pos_mean to `rocchio_pos_vec_3d`, neg_mean to `rocchio_neg_vec_3d`
@@ -182,8 +181,7 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
 
         # Filter out the neutral reactions and the already processed reactions
         past_interactions = [
-            (inter["physical_id"], inter["reaction"])
-            for inter in matches["interactions"]
+            (inter["physical_id"], inter["reaction"]) for inter in matches["interactions"]
         ]
         feedback_list = self.remove_neutral_and_duplicate_negative_interactions(
             feedback_list, past_interactions
@@ -249,10 +247,7 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
 
         return query_vectors
 
-    def retrieve_3d_exact_match(
-        self, emb_3d: Union[np.ndarray, List], org_id: int
-    ) -> List:
-        # TODO: Copy the 2D flow (retrieve_2d_exact_match)
+    def retrieve_3d_exact_match(self, emb_3d: Union[np.ndarray, List], org_id: int) -> List:
         """
         Retrieve 3D exact match in Rocchio index using embedding_vector_3d.
         Filtered by org_id and self.similarity_threshold.
@@ -292,9 +287,7 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
         )
 
         neutral_feedback_list = [
-            (physical_id, reaction)
-            for physical_id, reaction in feedback_list
-            if reaction == 0
+            (physical_id, reaction) for physical_id, reaction in feedback_list if reaction == 0
         ]
 
         # Step 0: Filter neutral feedback
@@ -312,18 +305,11 @@ class RocchioFeedback3D(RocchioFeedbackBase, RocchioFeedback2D):
         disliked_cluster_info = self._load_disliked_clusters_from_match(match)
 
         # Step 3: Forward (Update host in Rocchio + Update dislikes in similarity_clusters + Add disliked clusters to host in Rocchio)
-        remaining_feedback = self._get_remaining_feedback(
-            feedback_list, disliked_cluster_info
-        )
+        remaining_feedback = self._get_remaining_feedback(feedback_list, disliked_cluster_info)
 
         if remaining_feedback:
             print(f"remaining_feedback: {remaining_feedback}")
-            new_disliked_clusters = self._process_remaining_feedback(
-                remaining_feedback, org_id
-            )
-            self._update_or_create_host_doc(
-                match, emb_3d, new_disliked_clusters, project_id, org_id
-            )
+            new_disliked_clusters = self._process_remaining_feedback(remaining_feedback, org_id)
             self._update_or_create_host_doc(
                 match=match,
                 emb_vector=emb_3d,
