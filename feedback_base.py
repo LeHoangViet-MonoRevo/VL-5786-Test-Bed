@@ -50,6 +50,11 @@ class RocchioFeedbackBase:
         ]
 
     @staticmethod
+    def filter_feedback(feedback_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Remove neutral feedback."""
+        return [(pid, r) for pid, r in feedback_list if r != 0]
+
+    @staticmethod
     def rocchio_update(
         vecs: List[np.ndarray],
         pos_vecs: List[np.ndarray],
@@ -202,7 +207,7 @@ class RocchioFeedbackBase:
 
         if "disliked_cluster_ids" in source:
             result["disliked_cluster_ids"] = source["disliked_cluster_ids"]
-        
+
         if "neutralisations" in source:
             result["neutralisations"] = source["neutralisations"]
 

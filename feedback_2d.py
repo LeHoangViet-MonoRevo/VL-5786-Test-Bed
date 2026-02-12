@@ -320,12 +320,6 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
         return disliked_cluster_info
 
-    def _filter_feedback(
-        self, feedback_list: List[Tuple[int, int]]
-    ) -> List[Tuple[int, int]]:
-        """Remove neutral feedback."""
-        return [(pid, r) for pid, r in feedback_list if r != 0]
-
     def _load_disliked_clusters_from_match(
         self, match: Dict[str, Any]
     ) -> Dict[str, Dict[str, Any]]:
@@ -676,6 +670,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         self.elasticsearch_db.client.update(
             index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
             id=host_doc_id,
+            refresh="wait_for",
             script={
                 "lang": "painless",
                 "source": """
@@ -737,7 +732,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         ]
 
         # Step 0: Filter neutral feedback
-        feedback_list = self._filter_feedback(feedback_list)
+        feedback_list = self.filter_feedback(feedback_list)
 
         # Step 1: Retrieve exact match in Rocchio index
         hash_vector, match = self.retrieve_2d_exact_match(project_id, org_id)
