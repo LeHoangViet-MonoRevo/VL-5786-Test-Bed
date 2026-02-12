@@ -1,4 +1,5 @@
 import base64
+from asyncio import run
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -774,17 +775,19 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         )
 
         # Step 5: Handle neutralisations
+        # If a cluster is newly added in this run → its physical_ids must NOT participate in neutralisation.
         host_doc_id = match.get("doc_id")
         if host_doc_id:
-            disliked_physical_ids = self._collect_disliked_physical_ids(
-                combined_disliked_clusters
-            )
-
             now = datetime.now()
+
+            # ONLY use clusters that existed BEFORE this run
+            disliked_physical_ids_before = self._collect_disliked_physical_ids(
+                disliked_cluster_info
+            )
 
             to_add = self._build_neutralisations_to_add(
                 neutral_feedback_list,
-                disliked_physical_ids,
+                disliked_physical_ids_before,
                 now,
             )
 
@@ -796,5 +799,4 @@ class RocchioFeedback2D(RocchioFeedbackBase):
                 to_remove=to_remove,
                 now=now,
             )
-
         return query_vectors
