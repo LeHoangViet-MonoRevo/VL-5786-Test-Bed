@@ -437,7 +437,7 @@ class SimilaritySearchService:
         company_id: int,
         show_disliked_drawings: bool,
     ) -> pd.DataFrame:
-        """Add later"""
+        """Adjust results using Rocchio 2D dislike feedback."""
 
         # Step 1: Retrive the exact match from ROCCHIO index
         _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
@@ -487,7 +487,6 @@ class SimilaritySearchService:
                 disliked_phys_ids.add((pid, cluster_timestamp))
 
         # Step 5: Apply the disliked handler
-        result["reaction"] = 0
         result = self.apply_disliked_drawings(
             final_result=result,
             disliked_phys_ids=disliked_phys_ids,
@@ -734,6 +733,8 @@ class SimilaritySearchService:
                 subset=["physical_id"], keep="first"
             ).reset_index(drop=True)
 
+            # Add "reaction" column
+            final_result["reaction"] = 0
             final_result = self.process_dislikes_2d(
                 result=final_result,
                 project_id=project_id,
