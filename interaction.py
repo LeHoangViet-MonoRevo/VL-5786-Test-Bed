@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from elasticsearch.helpers import BulkIndexError, bulk
@@ -300,6 +301,241 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             logger.info("❌ Bulk index error:")
             for err in e.errors:
                 logger.info(err)
+
+    def remove_physical_id_from_neutralisations_in_rocchio(
+        self,
+        physical_id: int,
+        org_id: Optional[int] = None,
+    ) -> Dict:
+        """
+        Remove a physical_id from neutralisations array in Rocchio index.
+        """
+
+        try:
+            query = {
+                "bool": {
+                    "must": [
+                        {
+                            "nested": {
+                                "path": "neutralisations",
+                                "query": {
+                                    "term": {"neutralisations.physical_id": physical_id}
+                                },
+                            }
+                        }
+                    ]
+                }
+            }
+
+            if org_id is not None:
+                query["bool"]["must"].append({"term": {"org_id": str(org_id)}})
+
+            body = {
+                "query": query,
+                "script": {
+                    "lang": "painless",
+                    "source": """
+                        if (ctx._source.containsKey('neutralisations')) {
+                            ctx._source.neutralisations.removeIf(n -> n.physical_id == params.physical_id);
+                        }
+                        ctx._source.updated_at = params.now;
+                    """,
+                    "params": {"physical_id": physical_id, "now": "now"},
+                },
+            }
+
+            response = self.client.update_by_query(
+                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                body=body,
+                refresh="wait_for",
+                conflicts="proceed",
+            )
+
+            total = response.get("total", 0)
+            updated = response.get("updated", 0)
+            conflicts = response.get("version_conflicts", 0)
+
+            if total == 0:
+                logger.info(
+                    f"ℹ️ No Rocchio docs contain neutralised physical_id={physical_id}"
+                )
+            else:
+                logger.info(
+                    f"✅ Removed physical_id={physical_id} from neutralisations "
+                    f"(matched={total}, updated={updated}, conflicts={conflicts})"
+                )
+
+            return response
+
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to remove physical_id={physical_id} from neutralisations. Reason: {e}"
+            )
+            raise
+
+    def remove_physical_id_from_cluster(
+        self,
+        indice_name: str,
+        physical_id: int,
+        org_id: Optional[int] = None,
+    ) -> Dict:
+        """
+        Remove a physical_id from the physical_ids list in documents.
+        If the list becomes empty after removal, delete the document.
+        Args:
+            indice_name: Name of the Elasticsearch index
+            physical_id: The physical ID to remove from the list
+            org_id: Optional organization ID to filter documents
+        """
+        try:
+            query_filters = [{"term": {"physical_ids": int(physical_id)}}]
+            if org_id is not None:
+                query_filters.append({"term": {"org_id": str(org_id)}})
+
+            query = {"query": {"bool": {"filter": query_filters}}}
+
+            # Find all documents with this physical_id
+            response = self.client.search(
+                index=indice_name, body=query, size=10000, _source=["physical_ids"]
+            )
+            hits = response.get("hits", {}).get("hits", [])
+
+            if not hits:
+                logger.info(f"No documents found with physical_id {physical_id}")
+            updated_count = 0
+
+            for hit in hits:
+                doc_id = hit["_id"]
+                current_physical_ids = hit["_source"].get("physical_ids", [])
+
+                # Remove the physical_id from the list
+                new_physical_ids = [
+                    pid for pid in current_physical_ids if pid != physical_id
+                ]
+
+                # Update the document with the new list and updated_at timestamp
+                self.client.update(
+                    index=indice_name,
+                    id=doc_id,
+                    body={
+                        "doc": {
+                            "physical_ids": new_physical_ids,
+                            "updated_at": datetime.now().isoformat(),
+                        }
+                    },
+                )
+                updated_count += 1
+                logger.info(
+                    f"Updated document {doc_id}, removed physical_id {physical_id}"
+                )
+
+            # Refresh index to make changes visible
+            self.client.indices.refresh(index=indice_name)
+
+            logger.info(
+                f"✅ Removed physical_id {physical_id}: Updated {updated_count}"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to remove physical_id {physical_id} from {indice_name}. Reason: {e}"
+            )
+
+    def find_closest_cluster_and_append_physical_id(
+        self,
+        indice_name: str,
+        embedding_vector: List[float],
+        physical_id: int,
+        org_id: int,
+        version: str,
+        similarity_threshold: float = 0.98,
+    ) -> Dict:
+        """
+        Find the closest cluster based on embedding vector and append physical_id to it.
+        If no cluster is found above the threshold, create a new cluster.
+        Args:
+            indice_name: Name of the Elasticsearch index (similarity_clusters)
+            embedding_vector: The embedding vector to search with (phash for 2d, 3d embedding for 3d)
+            physical_id: The physical ID to append to the cluster
+            org_id: Organization ID
+            version: "2d" or "3d" to determine which embedding field to use
+            similarity_threshold: Minimum similarity score to consider a match
+        """
+        try:
+            # Determine embedding field based on version
+            if version == "v3":
+                embedding_field = "embedding_vector_2d"
+            elif version == "3d":
+                embedding_field = "embedding_vector_3d"
+            else:
+                raise ValueError(f"Invalid version '{version}', expected 'v3' or '3d'")
+
+            # Search for closest cluster
+            response = self.search_vector_w_filters(
+                indice_name=indice_name,
+                query_vector=embedding_vector,
+                number_retrieval_vector=1,
+                search_field=embedding_field,
+                filters=[
+                    {"term": {"org_id": str(org_id)}},
+                    {"term": {"version": version}},
+                ],
+                selected_cols=["physical_ids"],
+                vector_method="l2",
+                score_threshold=similarity_threshold,
+            )
+
+            if response and response.get("hits", {}).get("hits"):
+                # Found a matching cluster - append physical_id
+                hit = response["hits"]["hits"][0]
+                doc_id = hit["_id"]
+                current_physical_ids = hit["_source"].get("physical_ids", [])
+
+                # Check if physical_id already exists
+                if physical_id in current_physical_ids:
+                    logger.info(
+                        f"Physical ID {physical_id} already exists in cluster {doc_id}"
+                    )
+
+                # Append physical_id to the list
+                new_physical_ids = current_physical_ids + [physical_id]
+                self.client.update(
+                    index=indice_name,
+                    id=doc_id,
+                    body={
+                        "doc": {
+                            "physical_ids": new_physical_ids,
+                            "updated_at": datetime.utcnow().isoformat(),
+                        }
+                    },
+                )
+                logger.info(
+                    f"✅ Appended physical_id {physical_id} to cluster {doc_id}"
+                )
+            else:
+                now = datetime.utcnow().isoformat()
+                doc_body = {
+                    embedding_field: embedding_vector,
+                    "version": version,
+                    "org_id": str(org_id),
+                    "physical_ids": [physical_id],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                create_resp = self.client.index(
+                    index=indice_name,
+                    document=doc_body,
+                    refresh="wait_for",
+                )
+
+                logger.info(
+                    f"✅ Created new cluster {create_resp['_id']} with physical_id {physical_id}"
+                )
+
+        except Exception as e:
+            logger.error(
+                f"❌ Failed to find/append cluster for physical_id {physical_id}. Reason: {e}"
+            )
 
 
 elasticsearch_db = ElasticsearchBase()
