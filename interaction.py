@@ -308,70 +308,53 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         org_id: Optional[int] = None,
     ) -> Dict:
         """
-        Remove a physical_id from neutralisations array in Rocchio index.
+        Remove entries in neutralisations where physical_id == given physical_id.
         """
 
-        try:
-            query = {
-                "bool": {
-                    "must": [
-                        {
-                            "nested": {
-                                "path": "neutralisations",
-                                "query": {
-                                    "term": {"neutralisations.physical_id": physical_id}
-                                },
-                            }
+        if not self.check_indice_existance(
+            indice_name=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT
+        ):
+            return
+
+        query = {
+            "bool": {
+                "must": [
+                    {
+                        "nested": {
+                            "path": "neutralisations",
+                            "query": {
+                                "term": {"neutralisations.physical_id": physical_id}
+                            },
                         }
-                    ]
-                }
+                    }
+                ]
             }
+        }
 
-            if org_id is not None:
-                query["bool"]["must"].append({"term": {"org_id": str(org_id)}})
+        if org_id is not None:
+            query["bool"]["must"].append({"term": {"org_id": str(org_id)}})
 
-            body = {
-                "query": query,
-                "script": {
-                    "lang": "painless",
-                    "source": """
-                        if (ctx._source.containsKey('neutralisations')) {
-                            ctx._source.neutralisations.removeIf(n -> n.physical_id == params.physical_id);
-                        }
-                        ctx._source.updated_at = params.now;
-                    """,
-                    "params": {"physical_id": physical_id, "now": "now"},
-                },
-            }
+        body = {
+            "query": query,
+            "script": {
+                "lang": "painless",
+                "source": """
+                    if (ctx._source.containsKey('neutralisations')) {
+                        ctx._source.neutralisations.removeIf(
+                            n -> n.physical_id == params.physical_id
+                        );
+                    }
+                """,
+                "params": {"physical_id": physical_id},
+            },
+        }
 
-            response = self.client.update_by_query(
-                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-                body=body,
-                refresh="wait_for",
-                conflicts="proceed",
-            )
-
-            total = response.get("total", 0)
-            updated = response.get("updated", 0)
-            conflicts = response.get("version_conflicts", 0)
-
-            if total == 0:
-                logger.info(
-                    f"ℹ️ No Rocchio docs contain neutralised physical_id={physical_id}"
-                )
-            else:
-                logger.info(
-                    f"✅ Removed physical_id={physical_id} from neutralisations "
-                    f"(matched={total}, updated={updated}, conflicts={conflicts})"
-                )
-
-            return response
-
-        except Exception as e:
-            logger.error(
-                f"❌ Failed to remove physical_id={physical_id} from neutralisations. Reason: {e}"
-            )
-            raise
+        return self.client.update_by_query(
+            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            body=body,
+            refresh=True,
+            conflicts="proceed",
+        )
 
     def remove_physical_id_from_cluster(
         self,
@@ -381,7 +364,6 @@ class ElasticsearchBase(VectorDataBaseInteraction):
     ) -> Dict:
         """
         Remove a physical_id from the physical_ids list in documents.
-        If the list becomes empty after removal, delete the document.
         Args:
             indice_name: Name of the Elasticsearch index
             physical_id: The physical ID to remove from the list
@@ -505,7 +487,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     body={
                         "doc": {
                             "physical_ids": new_physical_ids,
-                            "updated_at": datetime.utcnow().isoformat(),
+                            "updated_at": datetime.now().isoformat(),
                         }
                     },
                 )
@@ -513,7 +495,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     f"✅ Appended physical_id {physical_id} to cluster {doc_id}"
                 )
             else:
-                now = datetime.utcnow().isoformat()
+                now = datetime.now().isoformat()
                 doc_body = {
                     embedding_field: embedding_vector,
                     "version": version,
