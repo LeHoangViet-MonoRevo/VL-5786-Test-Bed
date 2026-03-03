@@ -65,6 +65,49 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                 f"Failed to search data from indice {indice_name}. " f"Reason {e}"
             )
 
+    def search_vectors_batch(
+        self,
+        indice_name,
+        organization_id,
+        version,
+        list_query_vector,
+        number_retrieval_vector=100,
+        selected_cols=["product_id", "original_image"],
+    ):
+        field_embedding_vector_name = f"embedding_vector_{version}"
+
+        body = []
+
+        for query_vector in list_query_vector:
+            header = {"index": indice_name}
+
+            query = {
+                "size": number_retrieval_vector,
+                "_source": selected_cols,
+                "query": {
+                    "script_score": {
+                        "query": {
+                            "bool": {
+                                "filter": [
+                                    {"term": {"version": str(version)}},
+                                    {"term": {"organization_id": str(organization_id)}},
+                                ]
+                            }
+                        },
+                        "script": {
+                            "source": f"dotProduct(params.query_vector, '{field_embedding_vector_name}')",
+                            "params": {"query_vector": query_vector},
+                        },
+                    }
+                },
+            }
+
+            body.append(header)
+            body.append(query)
+
+        results = self.client.msearch(body=body)
+        return results
+
     def search_vector_w_filters(
         self,
         indice_name,
