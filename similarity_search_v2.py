@@ -1,3 +1,4 @@
+import time
 import traceback
 from datetime import datetime
 from typing import Dict, List, Set, Tuple, Union
@@ -167,6 +168,70 @@ class SimilaritySearchService:
         feature = feature.data.cpu().numpy().flatten()
         return feature / np.linalg.norm(feature)
 
+    def _es_search_sequential(self, list_query_vector, company_id, selected_cols):
+        indice_name = constants.ELASTICSEARCH_PREFIX
+        result_similarity = pd.DataFrame()
+
+        for query_vector in list_query_vector:
+            search_results = elasticsearch_db.search_vector(
+                indice_name=indice_name,
+                organization_id=company_id,
+                version="v2",
+                query_vector=query_vector,
+                selected_cols=selected_cols,
+            )
+
+            if (
+                not search_results
+                or "hits" not in search_results
+                or "hits" not in search_results["hits"]
+            ):
+                continue
+
+            hits = search_results["hits"]["hits"]
+            if not hits:
+                continue
+
+            df_res = pd.json_normalize(hits)
+            if df_res.empty:
+                continue
+
+            result_similarity = pd.concat(
+                [result_similarity, df_res], ignore_index=True
+            )
+
+        return result_similarity
+
+    def _es_search_batch(self, list_query_vector, company_id, selected_cols):
+        indice_name = constants.ELASTICSEARCH_PREFIX
+        result_similarity = pd.DataFrame()
+
+        batch_results = elasticsearch_db.search_vectors_batch(
+            indice_name=indice_name,
+            organization_id=company_id,
+            version="v2",
+            list_query_vector=list_query_vector,
+            selected_cols=selected_cols,
+        )
+
+        for res in batch_results["responses"]:
+            if "hits" not in res or not res["hits"]["hits"]:
+                continue
+
+            hits = res["hits"]["hits"]
+            if not hits:
+                continue
+
+            df_res = pd.json_normalize(hits)
+            if df_res.empty:
+                continue
+
+            result_similarity = pd.concat(
+                [result_similarity, df_res], ignore_index=True
+            )
+
+        return result_similarity
+
     def search_similar_project(
         self,
         list_query_vector,
@@ -184,34 +249,12 @@ class SimilaritySearchService:
             "number_objects",
         ]
         # TODO: Add code to benchmark ES retrieval time
-        for query_vector in list_query_vector:
-            search_results = elasticsearch_db.search_vector(
-                indice_name=indice_name,
-                organization_id=company_id,
-                version="v2",
-                query_vector=query_vector,
-                selected_cols=selected_cols,
-            )
-
-            # ✅ Safely handle None or empty responses
-            if (
-                not search_results
-                or "hits" not in search_results
-                or "hits" not in search_results["hits"]
-            ):
-                continue
-
-            hits = search_results["hits"]["hits"]
-            if not hits:  # empty list
-                continue
-
-            df_res = pd.json_normalize(hits)
-            if df_res.empty:
-                continue
-
-            result_similarity = pd.concat(
-                [result_similarity, df_res], ignore_index=True
-            )
+        start_time = time.perf_counter()
+        result_similarity = self._es_search_sequential(
+            list_query_vector, company_id, selected_cols
+        )
+        end_time = time.perf_counter()
+        print(f"[ES Sequential] {end_time - start_time:.4f}s")
 
         # If retrievals are empty
         if len(result_similarity) == 0:
@@ -791,7 +834,7 @@ if __name__ == "__main__":
     feedback_list = []
     show_disliked_drawings = True
 
-    res = similarity_search_service.ranking_project_ref(
+    res, _ = similarity_search_service.ranking_project_ref(
         project_id=project_id,
         company_id=company_id,
         ocr_result=ocr_result,
@@ -801,3 +844,4 @@ if __name__ == "__main__":
     )
 
     print(f"res: {res}")
+    res.to_csv("before.csv", index=None)
