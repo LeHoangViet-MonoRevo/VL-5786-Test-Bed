@@ -249,12 +249,22 @@ class SimilaritySearchService:
             "number_objects",
         ]
         # TODO: Add code to benchmark ES retrieval time
+        # start_time = time.perf_counter()
+        # result_similarity = self._es_search_sequential(
+        #     list_query_vector, company_id, selected_cols
+        # )
+        # end_time = time.perf_counter()
+        # print(f"[ES Sequential] {end_time - start_time:.4f}s")
+
         start_time = time.perf_counter()
-        result_similarity = self._es_search_sequential(
-            list_query_vector, company_id, selected_cols
+        result_similarity = self._es_search_batch(
+            list_query_vector=list_query_vector,
+            company_id=company_id,
+            selected_cols=selected_cols,
         )
         end_time = time.perf_counter()
-        print(f"[ES Sequential] {end_time - start_time:.4f}s")
+        print(f"[ES Batch] {end_time - start_time:.4f}s")
+
 
         # If retrievals are empty
         if len(result_similarity) == 0:
@@ -844,4 +854,3 @@ if __name__ == "__main__":
     )
 
     print(f"res: {res}")
-    res.to_csv("before.csv", index=None)
