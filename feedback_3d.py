@@ -26,7 +26,8 @@ class RocchioFeedback3D(RocchioFeedback2D):
 
         # Filter out the neutral reactions and already processed reactions
         past_interactions = [
-            (inter["physical_id"], inter["reaction"]) for inter in matches["interactions"]
+            (inter["physical_id"], inter["reaction"])
+            for inter in matches["interactions"]
         ]
         feedback_list = self.remove_neutral_and_duplicate_negative_interactions(
             feedback_list, past_interactions
@@ -49,9 +50,9 @@ class RocchioFeedback3D(RocchioFeedback2D):
 
             interactions_save_in_es = self.convert_feedback_to_interactions(
                 feedback_list,
-                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"]["properties"][
-                    "interactions"
-                ]["properties"].keys(),
+                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"][
+                    "properties"
+                ]["interactions"]["properties"].keys(),
             )
 
             # Save the pos_mean to `rocchio_pos_vec_3d`, neg_mean to `rocchio_neg_vec_3d`
@@ -181,7 +182,8 @@ class RocchioFeedback3D(RocchioFeedback2D):
 
         # Filter out the neutral reactions and the already processed reactions
         past_interactions = [
-            (inter["physical_id"], inter["reaction"]) for inter in matches["interactions"]
+            (inter["physical_id"], inter["reaction"])
+            for inter in matches["interactions"]
         ]
         feedback_list = self.remove_neutral_and_duplicate_negative_interactions(
             feedback_list, past_interactions
@@ -247,7 +249,9 @@ class RocchioFeedback3D(RocchioFeedback2D):
 
         return query_vectors
 
-    def retrieve_3d_exact_match(self, emb_3d: Union[np.ndarray, List], org_id: int) -> List:
+    def retrieve_3d_exact_match(
+        self, emb_3d: Union[np.ndarray, List], org_id: int
+    ) -> List:
         """
         Retrieve 3D exact match in Rocchio index using embedding_vector_3d.
         Filtered by org_id and self.similarity_threshold.
@@ -268,7 +272,7 @@ class RocchioFeedback3D(RocchioFeedback2D):
         project_id: Union[int, str],
         org_id: str,
         feedback_list: List[Tuple[int, int]] = [],
-    ) -> None:
+    ) -> Dict:
         """
         Add later
         """
@@ -287,11 +291,13 @@ class RocchioFeedback3D(RocchioFeedback2D):
         )
 
         neutral_feedback_list = [
-            (physical_id, reaction) for physical_id, reaction in feedback_list if reaction == 0
+            (physical_id, reaction)
+            for physical_id, reaction in feedback_list
+            if reaction == 0
         ]
 
         # Step 0: Filter neutral feedback
-        feedback_list = self.filter_feedback(
+        disliked_feedback_list = self.filter_disliked_feedback(
             feedback_list
         )  # Refactor and put this function in RocchioBase later
 
@@ -305,11 +311,15 @@ class RocchioFeedback3D(RocchioFeedback2D):
         disliked_cluster_info = self._load_disliked_clusters_from_match(match)
 
         # Step 3: Forward (Update host in Rocchio + Update dislikes in similarity_clusters + Add disliked clusters to host in Rocchio)
-        remaining_feedback = self._get_remaining_feedback(feedback_list, disliked_cluster_info)
+        remaining_feedback = self._get_remaining_feedback(
+            disliked_feedback_list, disliked_cluster_info
+        )
 
         if remaining_feedback:
             print(f"remaining_feedback: {remaining_feedback}")
-            new_disliked_clusters = self._process_remaining_feedback(remaining_feedback, org_id)
+            new_disliked_clusters = self._process_remaining_feedback(
+                remaining_feedback, org_id
+            )
             self._update_or_create_host_doc(
                 match=match,
                 emb_vector=emb_3d,
@@ -355,7 +365,7 @@ class RocchioFeedback3D(RocchioFeedback2D):
                 now,
             )
 
-            to_remove = self._build_neutralisations_to_remove(feedback_list)
+            to_remove = self._build_neutralisations_to_remove(disliked_feedback_list)
 
             self._update_neutralisations_in_es(
                 host_doc_id=host_doc_id,
@@ -364,4 +374,74 @@ class RocchioFeedback3D(RocchioFeedback2D):
                 now=now,
             )
 
-        return
+        return match
+
+    def update_vectors_w_rocchio_3d(
+        self,
+        query_vectors: List[np.ndarray],
+        feedback_list: List[Tuple[int, int]],
+        host_match: Dict,
+        org_id: Union[int, str],
+    ) -> List[np.ndarray]:
+
+        # Step 1: Previous positive centroid (shape = (512,))
+        prev_pos_vec = host_match.get("rocchio_pos_vec_3d", None)
+        if prev_pos_vec is not None:
+            prev_pos_vec = np.array(prev_pos_vec, dtype=np.float32)
+
+        # Step 2: Only positive feedback
+        pos_feedback_list = [
+            (physical_id, reaction)
+            for (physical_id, reaction) in feedback_list
+            if reaction == 1
+        ]
+
+        # If nothing new and no previous centroid → no update
+        if not pos_feedback_list and prev_pos_vec is None:
+            return query_vectors
+
+        # Step 3: Extract vectors from positive feedback
+        if pos_feedback_list:
+            pos_vecs, _ = self._extract_feedback_vectors(
+                feedback_list=pos_feedback_list,
+                embedding_index=constants.ELASTICSEARCH_PREFIX,
+                embedding_vector_field="embedding_vector_3d",
+                routing_key=f"3d___{str(org_id)}",
+            )
+
+        # Step 4: Add previous centroid as ONE vector
+        if prev_pos_vec is not None:
+            pos_vecs = pos_vecs + [prev_pos_vec]
+
+        # Step 5: Rocchio (no negatives for 2D)
+        updated, pos_mean, _ = self.rocchio_update(
+            vecs=query_vectors,
+            pos_vecs=pos_vecs,
+            neg_vecs=[],
+            return_intermediates=True,
+        )
+
+        pos_mean = self.add_epsilon(pos_mean)
+
+        # Step 6: Persist
+        if (
+            host_match.get("similarity_score") is not None
+            and host_match["similarity_score"] >= self.similarity_threshold
+        ):
+            doc_id = host_match["doc_id"]
+
+            update_body = {
+                "doc": {
+                    "rocchio_pos_vec_3d": pos_mean.tolist(),
+                    "updated_at": datetime.now(),
+                }
+            }
+
+            self.elasticsearch_db.client.update(
+                index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+                id=doc_id,
+                body=update_body,
+                refresh="wait_for",
+            )
+
+        return updated

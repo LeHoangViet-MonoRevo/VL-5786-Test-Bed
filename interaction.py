@@ -364,6 +364,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
     ) -> Dict:
         """
         Remove a physical_id from the physical_ids list in documents.
+        If the list becomes empty after removal, delete the document.
         Args:
             indice_name: Name of the Elasticsearch index
             physical_id: The physical ID to remove from the list
@@ -487,7 +488,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     body={
                         "doc": {
                             "physical_ids": new_physical_ids,
-                            "updated_at": datetime.now().isoformat(),
+                            "updated_at": datetime.utcnow().isoformat(),
                         }
                     },
                 )
@@ -495,7 +496,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     f"✅ Appended physical_id {physical_id} to cluster {doc_id}"
                 )
             else:
-                now = datetime.now().isoformat()
+                now = datetime.utcnow().isoformat()
                 doc_body = {
                     embedding_field: embedding_vector,
                     "version": version,

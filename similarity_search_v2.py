@@ -1,6 +1,6 @@
 import traceback
 from datetime import datetime
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Dict, List, Set, Tuple, Union
 
 import imagehash
 import numpy as np
@@ -171,20 +171,10 @@ class SimilaritySearchService:
         self,
         list_query_vector,
         company_id: str,
-        project_id: str,
-        feedback_list: List[Tuple] = [],
     ) -> pd.DataFrame:
         indice_name = constants.ELASTICSEARCH_PREFIX
         if not elasticsearch_db.check_indice_existance(indice_name=indice_name):
             return None
-
-        list_query_vector = self.rocchio_feedback_2d.run(
-            query_vectors=list_query_vector,
-            project_id=project_id,
-            org_id=company_id,
-            embedding_index=indice_name,
-            feedback_list=feedback_list,
-        )
 
         result_similarity = pd.DataFrame()
         selected_cols = [
@@ -193,6 +183,7 @@ class SimilaritySearchService:
             "original_image",
             "number_objects",
         ]
+        # TODO: Add code to benchmark ES retrieval time
         for query_vector in list_query_vector:
             search_results = elasticsearch_db.search_vector(
                 indice_name=indice_name,
@@ -308,6 +299,9 @@ class SimilaritySearchService:
         Note: disliked is already sorted by date (not by score like the normal)
               -> order is kept in this function.
         """
+        if not result:
+            return result
+
         df = pd.DataFrame(result)
 
         normal, disliked = df[df["reaction"] != -1], df[df["reaction"] == -1]
@@ -439,7 +433,7 @@ class SimilaritySearchService:
     ) -> pd.DataFrame:
         """Adjust results using Rocchio 2D dislike feedback."""
 
-        # Step 1: Retrive the exact match from ROCCHIO index
+        # Step 1: Retrieve the exact match from ROCCHIO index
         _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
             project_id, company_id
         )
@@ -517,8 +511,22 @@ class SimilaritySearchService:
                 # crop = base64_to_image(image["image_base64"])
                 crop = base64_to_image(image["_source"]["data"])
                 list_query.append(self.extract_feature(crop))
+
+            # Feedback handling
+            host_match = self.rocchio_feedback_2d.execute_feedback_update_2d(
+                project_id=project_id, org_id=company_id, feedback_list=feedback_list
+            )
+
+            list_query = self.rocchio_feedback_2d.update_vectors_w_rocchio_2d(
+                query_vectors=list_query,
+                feedback_list=feedback_list,
+                host_match=host_match,
+                org_id=company_id,
+            )
+
             similar_df = self.search_similar_project(
-                list_query, company_id, project_id, feedback_list
+                list_query,
+                company_id,
             )
             if similar_df is None:
                 return [], []
@@ -780,28 +788,7 @@ if __name__ == "__main__":
     company_id = "1"
     ocr_result = DummyOCRResult()
     basic_info_metadata = get_diagram_ocr_physical_types(company_id)
-    feedback_list = [
-        (271558, 0),
-        (1266, 0),
-        (1265, 0),
-        (1626, 0),
-        (265798, 0),
-        (414, 0),
-        (82, 0),
-        (9009, 0),
-        (21, 0),
-        (1146, 0),
-        (1070, 0),
-        (978, 0),
-        (958, 0),
-        (951, 0),
-        (945, 0),
-        (944, 0),
-        (913, 0),
-        (911, 0),
-        (908, 0),
-        (905, -1),
-    ]
+    feedback_list = []
     show_disliked_drawings = True
 
     res = similarity_search_service.ranking_project_ref(
@@ -813,4 +800,4 @@ if __name__ == "__main__":
         show_disliked_drawings=show_disliked_drawings,
     )
 
-    # print(f"res: {res}")
+    print(f"res: {res}")

@@ -50,9 +50,11 @@ class RocchioFeedbackBase:
         ]
 
     @staticmethod
-    def filter_feedback(feedback_list: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """Remove neutral feedback."""
-        return [(pid, r) for pid, r in feedback_list if r != 0]
+    def filter_disliked_feedback(
+        feedback_list: List[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        """Return feedback where reaction==-1"""
+        return [(pid, r) for pid, r in feedback_list if r == -1]
 
     @staticmethod
     def rocchio_update(
@@ -63,7 +65,7 @@ class RocchioFeedbackBase:
         beta: float = 0.75,
         gamma: float = 0.25,
         return_intermediates: bool = False,
-    ):
+    ) -> List[np.ndarray]:
         """Rocchio update with optional returning of pos_mean/neg_mean."""
         d = vecs[0].shape[-1]
 
