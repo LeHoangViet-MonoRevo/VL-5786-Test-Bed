@@ -105,7 +105,10 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             body.append(header)
             body.append(query)
 
-        results = self.client.msearch(body=body)
+        results = self.client.msearch(
+            body=body,
+            filter_path=["responses.hits.hits._source", "responses.hits.hits._score"],
+        )
         return results
 
     def search_vector_w_filters(
