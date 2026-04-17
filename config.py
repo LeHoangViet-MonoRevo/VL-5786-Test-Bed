@@ -28,6 +28,15 @@ class Settings:
         self.APP_SEARCH_UPDATER_RESOURCE_PATH = os.getenv(
             "APP_SEARCH_UPDATER_RESOURCE_PATH"
         )
+        self.PRODUCTION_DATABASE_HOST: str = os.getenv("PRODUCTION_DATABASE_HOST", "")
+        self.PRODUCTION_DATABASE_PORT: str = int(
+            os.getenv("PRODUCTION_DATABASE_PORT", 3306)
+        )
+        self.PRODUCTION_DATABASE_USER: str = os.getenv("PRODUCTION_DATABASE_USER", "")
+        self.PRODUCTION_DATABASE_PASSWORD: str = os.getenv(
+            "PRODUCTION_DATABASE_PASSWORD", ""
+        )
+        self.PRODUCTION_DATABASE_DATABASE: str = os.getenv("PRODUCTION_DATABASE", "")
 
 
 settings = Settings()

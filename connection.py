@@ -23,6 +23,16 @@ def es_connection():
     return es.options(request_timeout=60)
 
 
+def mysql_production_connection():
+    conn = pymysql.connect(
+        host=settings.PRODUCTION_DATABASE_HOST,
+        user=settings.PRODUCTION_DATABASE_USER,
+        password=settings.PRODUCTION_DATABASE_PASSWORD,
+        database=settings.PRODUCTION_DATABASE_DATABASE,
+    )
+    return conn
+
+
 es_client = es_connection()
 
 
