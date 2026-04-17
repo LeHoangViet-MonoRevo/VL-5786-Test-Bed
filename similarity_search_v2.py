@@ -168,7 +168,8 @@ class SimilaritySearchService:
         feature = feature.data.cpu().numpy().flatten()
         return feature / np.linalg.norm(feature)
 
-    def _es_search_sequential(self, list_query_vector, company_id, selected_cols):
+    @staticmethod
+    def _es_search_sequential(list_query_vector, company_id, selected_cols):
         indice_name = constants.ELASTICSEARCH_PREFIX
         result_similarity = pd.DataFrame()
 
@@ -202,7 +203,8 @@ class SimilaritySearchService:
 
         return result_similarity
 
-    def _es_search_batch(self, list_query_vector, company_id, selected_cols):
+    @staticmethod
+    def _es_search_batch(list_query_vector, company_id, selected_cols):
         indice_name = constants.ELASTICSEARCH_PREFIX
         result_similarity = pd.DataFrame()
 
@@ -248,14 +250,8 @@ class SimilaritySearchService:
             "original_image",
             "number_objects",
         ]
-        # TODO: Add code to benchmark ES retrieval time
-        # start_time = time.perf_counter()
-        # result_similarity = self._es_search_sequential(
-        #     list_query_vector, company_id, selected_cols
-        # )
-        # end_time = time.perf_counter()
-        # print(f"[ES Sequential] {end_time - start_time:.4f}s")
 
+        # ───────────── Benchmark batch (_msearch) ─────────────
         start_time = time.perf_counter()
         result_similarity = self._es_search_batch(
             list_query_vector=list_query_vector,
@@ -263,8 +259,7 @@ class SimilaritySearchService:
             selected_cols=selected_cols,
         )
         end_time = time.perf_counter()
-        print(f"[ES Batch] {end_time - start_time:.4f}s")
-
+        logger.info(f"[ES Batch] {end_time - start_time:.4f}s")
 
         # If retrievals are empty
         if len(result_similarity) == 0:
