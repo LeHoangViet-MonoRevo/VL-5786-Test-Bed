@@ -33,7 +33,6 @@ class SimilaritySearchV3:
         Computes a normalised perceptual hash vector from project's image and
         queries Elasticsearch for similar items.
         """
-
         image_info = elasticsearch_db.find(
             indice_name=constants.ZONE_ENCODED_DATA_PHYSICAL_OBJECT,
             field_name="object_id",
@@ -135,9 +134,6 @@ class SimilaritySearchService:
             model_name=constants.MODEL_EXTRACTION_NAME
         )
         self.rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
-        self.similarity_clusters_2d = SimilarityClusters(
-            elasticsearch_db=elasticsearch_db, mode="2d"
-        )
 
     def check_production_info(self, word):
         probabilities = self.model_text_classification.predict_proba([word])
@@ -205,6 +201,7 @@ class SimilaritySearchService:
 
     @staticmethod
     def _es_search_batch(list_query_vector, company_id, selected_cols):
+        # TODO: Optimise this function
         indice_name = constants.ELASTICSEARCH_PREFIX
         result_similarity = pd.DataFrame()
 
@@ -480,8 +477,10 @@ class SimilaritySearchService:
         show_disliked_drawings: bool,
     ) -> pd.DataFrame:
         """Adjust results using Rocchio 2D dislike feedback."""
+        # TODO: If show_disliked_drawings is False -> No need to retrieve disliked items from ES
 
         # Step 1: Retrieve the exact match from ROCCHIO index
+        # Bottleneck 1
         _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
             project_id, company_id
         )
@@ -502,7 +501,15 @@ class SimilaritySearchService:
         # Fetch clusters from similarity_clusters
         resp = elasticsearch_db.client.mget(
             index=constants.SIMILARITY_CLUSTERS,
-            body={"ids": list(cluster_timestamp_map.keys())},
+            body={
+                "docs": [
+                    {
+                        "_id": cluster_id,
+                        "_source": ["physical_ids"],
+                    }
+                    for cluster_id in cluster_timestamp_map.keys()
+                ]
+            },
         )
 
         # Step 3: Get the "neutralisations"
@@ -832,13 +839,13 @@ if __name__ == "__main__":
 
     similarity_search_service = SimilaritySearchService()
 
-    project_id = "1770545102104"
+    project_id = "1776657602296"
     company_id = "1"
     ocr_result = DummyOCRResult()
     basic_info_metadata = get_diagram_ocr_physical_types(company_id)
     feedback_list = []
     show_disliked_drawings = True
-
+    t0 = time.perf_counter()
     res, _ = similarity_search_service.ranking_project_ref(
         project_id=project_id,
         company_id=company_id,
@@ -847,5 +854,6 @@ if __name__ == "__main__":
         feedback_list=feedback_list,
         show_disliked_drawings=show_disliked_drawings,
     )
-
+    t1 = time.perf_counter()
+    print(f"Time taken: {t1 - t0:.4f} seconds")
     print(f"res: {res}")
