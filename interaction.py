@@ -15,6 +15,7 @@ logger = logger.get_logger(logger_name="ELASTICSEARCH_DB")
 class ElasticsearchBase(VectorDataBaseInteraction):
     def __init__(self):
         self.client = es_client
+        self._existing_indices_cache = set()
 
     def search_vector(
         self,
@@ -166,7 +167,13 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             return None
 
     def find(
-        self, indice_name, field_name=None, value=None, query=None, routing_field=None
+        self,
+        indice_name,
+        field_name=None,
+        value=None,
+        query=None,
+        routing_field=None,
+        size=10000,
     ):
         if query is None and field_name is not None and value is not None:
             if isinstance(value, (list, tuple, set)):
@@ -178,7 +185,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
 
         try:
             response = self.client.search(
-                index=indice_name, body=query, size=10000, routing=routing_field
+                index=indice_name, body=query, size=size, routing=routing_field
             )
             logger.info(f"Query '{indice_name}' Successfully.")
             return response
@@ -237,7 +244,10 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                 f"Reason {e}"
             )
 
-    def check_indice_existance(self, indice_name, create=False, body=None):
+    def check_indice_existance_noncache(self, indice_name, create=False, body=None):
+        """
+        Check if an Elasticsearch index exists without using cache.
+        """
         try:
             if self.client.indices.exists(index=indice_name):
                 logger.info(f"✅ Index '{indice_name}' exists.")
@@ -250,6 +260,40 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                 return False
         except Exception as e:
             logger.error(f"Failed to fetch data from Elasticsearch. " f"Reason {e}")
+            return False
+
+    def check_indice_existance(self, indice_name, create=False, body=None):
+        """
+        Check if an Elasticsearch index exists, using an in-memory cache to avoid repeated ES calls.
+
+        ⚠️ Caveats:
+        - Cache is never invalidated during process lifetime.
+        - Assumes indices are not deleted after creation.
+        - If an index is manually deleted externally, this may return True incorrectly.
+        - Subsequent ES operations may fail due to stale cache.
+        """
+        try:
+            # 🚀 Fast path: cache hit
+            if indice_name in self._existing_indices_cache:
+                return True
+
+            # 🐢 Slow path: ES call
+            if self.client.indices.exists(index=indice_name):
+                logger.info(f"✅ Index '{indice_name}' exists.")
+                self._existing_indices_cache.add(indice_name)
+                return True
+
+            logger.info(f"❌ Index '{indice_name}' does not exist.")
+
+            if create:
+                self.create_indice(indice_name=indice_name, body=body)
+                self._existing_indices_cache.add(indice_name)
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to fetch data from Elasticsearch. Reason {e}")
             return False
 
     def bulk_insert_vector(self, indice_name, docs, overwrite=True, id_column=None):
@@ -410,60 +454,42 @@ class ElasticsearchBase(VectorDataBaseInteraction):
     ) -> Dict:
         """
         Remove a physical_id from the physical_ids list in documents.
-        If the list becomes empty after removal, delete the document.
-        Args:
-            indice_name: Name of the Elasticsearch index
-            physical_id: The physical ID to remove from the list
-            org_id: Optional organization ID to filter documents
+        If the list becomes empty after removal, keep the document.
         """
         try:
             query_filters = [{"term": {"physical_ids": int(physical_id)}}]
             if org_id is not None:
                 query_filters.append({"term": {"org_id": str(org_id)}})
 
-            query = {"query": {"bool": {"filter": query_filters}}}
-
-            # Find all documents with this physical_id
-            response = self.client.search(
-                index=indice_name, body=query, size=10000, _source=["physical_ids"]
-            )
-            hits = response.get("hits", {}).get("hits", [])
-
-            if not hits:
-                logger.info(f"No documents found with physical_id {physical_id}")
-            updated_count = 0
-
-            for hit in hits:
-                doc_id = hit["_id"]
-                current_physical_ids = hit["_source"].get("physical_ids", [])
-
-                # Remove the physical_id from the list
-                new_physical_ids = [
-                    pid for pid in current_physical_ids if pid != physical_id
-                ]
-
-                # Update the document with the new list and updated_at timestamp
-                self.client.update(
-                    index=indice_name,
-                    id=doc_id,
-                    body={
-                        "doc": {
-                            "physical_ids": new_physical_ids,
-                            "updated_at": datetime.now().isoformat(),
-                        }
+            response = self.client.update_by_query(
+                index=indice_name,
+                refresh=True,
+                conflicts="proceed",  # skip version conflicts, don't abort the whole operation
+                body={
+                    "query": {"bool": {"filter": query_filters}},
+                    "script": {
+                        "lang": "painless",
+                        "source": """
+                            ctx._source.physical_ids.removeIf(
+                                pid -> pid == params.physical_id
+                            );
+                            ctx._source.updated_at = params.now;
+                        """,
+                        "params": {
+                            "physical_id": physical_id,
+                            "now": datetime.utcnow().isoformat(),
+                        },
                     },
-                )
-                updated_count += 1
-                logger.info(
-                    f"Updated document {doc_id}, removed physical_id {physical_id}"
-                )
-
-            # Refresh index to make changes visible
-            self.client.indices.refresh(index=indice_name)
-
-            logger.info(
-                f"✅ Removed physical_id {physical_id}: Updated {updated_count}"
+                },
             )
+
+            updated = response.get("updated", 0)
+            deleted = response.get("deleted", 0)
+            logger.info(
+                f"✅ Removed physical_id {physical_id}: "
+                f"updated={updated}, deleted={deleted}"
+            )
+            return response
 
         except Exception as e:
             logger.error(
@@ -482,16 +508,8 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         """
         Find the closest cluster based on embedding vector and append physical_id to it.
         If no cluster is found above the threshold, create a new cluster.
-        Args:
-            indice_name: Name of the Elasticsearch index (similarity_clusters)
-            embedding_vector: The embedding vector to search with (phash for 2d, 3d embedding for 3d)
-            physical_id: The physical ID to append to the cluster
-            org_id: Organization ID
-            version: "2d" or "3d" to determine which embedding field to use
-            similarity_threshold: Minimum similarity score to consider a match
         """
         try:
-            # Determine embedding field based on version
             if version == "v3":
                 embedding_field = "embedding_vector_2d"
             elif version == "3d":
@@ -499,7 +517,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             else:
                 raise ValueError(f"Invalid version '{version}', expected 'v3' or '3d'")
 
-            # Search for closest cluster
+            # Only fetch _id — we no longer need physical_ids client-side.
             response = self.search_vector_w_filters(
                 indice_name=indice_name,
                 query_vector=embedding_vector,
@@ -509,38 +527,47 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     {"term": {"org_id": str(org_id)}},
                     {"term": {"version": version}},
                 ],
-                selected_cols=["physical_ids"],
+                selected_cols=["_id"],  # ← was ["physical_ids"], saves transfer
                 vector_method="l2",
                 score_threshold=similarity_threshold,
             )
 
             if response and response.get("hits", {}).get("hits"):
-                # Found a matching cluster - append physical_id
-                hit = response["hits"]["hits"][0]
-                doc_id = hit["_id"]
-                current_physical_ids = hit["_source"].get("physical_ids", [])
+                doc_id = response["hits"]["hits"][0]["_id"]
 
-                # Check if physical_id already exists
-                if physical_id in current_physical_ids:
-                    logger.info(
-                        f"Physical ID {physical_id} already exists in cluster {doc_id}"
-                    )
-
-                # Append physical_id to the list
-                new_physical_ids = current_physical_ids + [physical_id]
+                # Atomic server-side append via Painless script.
+                # Avoids: fetch physical_ids → mutate in Python → send full list back.
+                # Also handles the duplicate-check and the updated_at stamp in one trip.
                 self.client.update(
                     index=indice_name,
                     id=doc_id,
                     body={
-                        "doc": {
-                            "physical_ids": new_physical_ids,
-                            "updated_at": datetime.utcnow().isoformat(),
+                        "script": {
+                            "lang": "painless",
+                            "source": """
+                                if (ctx._source.physical_ids == null) {
+                                    ctx._source.physical_ids = [params.pid];
+                                } else if (!ctx._source.physical_ids.contains(params.pid)) {
+                                    ctx._source.physical_ids.add(params.pid);
+                                } else {
+                                    ctx.op = 'none';   // no-op: skip write entirely
+                                }
+                                if (ctx.op != 'none') {
+                                    ctx._source.updated_at = params.now;
+                                }
+                            """,
+                            "params": {
+                                "pid": physical_id,
+                                "now": datetime.utcnow().isoformat(),
+                            },
                         }
                     },
+                    retry_on_conflict=3,  # handles concurrent writers on the same doc
                 )
                 logger.info(
                     f"✅ Appended physical_id {physical_id} to cluster {doc_id}"
                 )
+
             else:
                 now = datetime.utcnow().isoformat()
                 doc_body = {
@@ -551,12 +578,12 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     "created_at": now,
                     "updated_at": now,
                 }
+                # Drop refresh="wait_for" — avoids blocking the shard refresh cycle.
+                # Call client.indices.refresh() explicitly only where consistency is required.
                 create_resp = self.client.index(
                     index=indice_name,
                     document=doc_body,
-                    refresh="wait_for",
                 )
-
                 logger.info(
                     f"✅ Created new cluster {create_resp['_id']} with physical_id {physical_id}"
                 )
