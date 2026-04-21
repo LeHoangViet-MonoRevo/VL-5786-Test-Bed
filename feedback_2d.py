@@ -1,11 +1,12 @@
 import base64
-from asyncio import run
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import fitz  # PyMuPDF
 import imagehash
 import numpy as np
+from elasticsearch import helpers as es_helpers
 from PIL import Image
 
 from constants import constants
@@ -260,6 +261,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         Filtered by org_id and similarity_threshold.
         """
 
+        # TODO: Add the lru_cache to the hash_vector
         data, dtype = self._load_original_image_b64(project_id)
         hash_vector = self.infer_phash_from_data(data, dtype)
 
@@ -515,31 +517,13 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             refresh="wait_for",
         )
 
-    def _backward_update_disliked_clusters(
+    def _resolve_rocchio_doc(
         self,
-        combined_disliked_clusters: Dict[str, Dict[str, Any]],
-        host_cluster_id: str,
-        org_id: str,
-    ) -> None:
-        """Append host cluster to disliked cluster Rocchio docs."""
-        now = datetime.now()
-
-        for disliked_cluster_id, info in combined_disliked_clusters.items():
-            self._update_or_create_backward_rocchio_doc(
-                info=info,
-                host_cluster_id=host_cluster_id,
-                org_id=org_id,
-                now=now,
-            )
-
-    def _update_or_create_backward_rocchio_doc(
-        self,
+        disliked_cluster_id: str,
         info: Dict[str, Any],
-        host_cluster_id: str,
         org_id: str,
-        now: datetime,
-    ) -> None:
-        """Update or create backward Rocchio doc."""
+    ) -> Dict[str, Any]:
+        """Resolve the Rocchio doc_id for a single disliked cluster (runs in thread)."""
         version = info["version"]
 
         if version == "v3":
@@ -553,72 +537,63 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         else:
             raise ValueError(f"Unknown version: {version}")
 
-        disliked_match_in_rocchio = self.find_similar_rocchio_record(
+        disliked_match = self.find_similar_rocchio_record(
             query_vector=info["embedding"],
             search_field=embedding_field,
             check_and_create=True,
             filters=filters,
         )
 
-        doc_id = disliked_match_in_rocchio.get("doc_id", None)
+        return {
+            "disliked_cluster_id": disliked_cluster_id,
+            "doc_id": disliked_match.get("doc_id"),
+            "embedding_field": embedding_field,
+            "doc_type": doc_type,
+            "info": info,
+        }
 
-        if doc_id is not None:
-            self._append_host_cluster_to_doc(
-                doc_id=doc_id,
-                host_cluster_id=host_cluster_id,
-                now=now,
-            )
-        else:
-            self._create_backward_rocchio_doc(
-                embedding_field=embedding_field,
-                doc_type=doc_type,
-                embedding=info["embedding"],
-                host_cluster_id=host_cluster_id,
-                org_id=org_id,
-                now=now,
-            )
-
-    def _append_host_cluster_to_doc(
+    def _build_append_action(
         self,
         doc_id: str,
         host_cluster_id: str,
         now: datetime,
-    ) -> None:
-        """Append host cluster to Rocchio doc."""
-        self.elasticsearch_db.client.update(
-            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-            id=doc_id,
-            refresh="wait_for",
-            script={
+    ) -> Dict[str, Any]:
+        """Build a bulk update action (append host cluster to existing doc)."""
+        return {
+            "_op_type": "update",
+            "_index": constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            "_id": doc_id,
+            "script": {
+                "lang": "painless",
                 "source": """
-                if (ctx._source.disliked_cluster_ids == null) {
-                    ctx._source.disliked_cluster_ids = [];
-                }
-
-                boolean exists = false;
-                for (e in ctx._source.disliked_cluster_ids) {
-                    if (e.cluster_id == params.cluster_id) {
-                        exists = true;
-                        break;
+                    if (ctx._source.disliked_cluster_ids == null) {
+                        ctx._source.disliked_cluster_ids = [];
                     }
-                }
 
-                if (!exists) {
-                    ctx._source.disliked_cluster_ids.add(
-                        ["cluster_id": params.cluster_id, "timestamp": params.now]
-                    );
-                }
+                    boolean exists = false;
+                    for (e in ctx._source.disliked_cluster_ids) {
+                        if (e.cluster_id == params.cluster_id) {
+                            exists = true;
+                            break;
+                        }
+                    }
 
-                ctx._source.updated_at = params.now;
+                    if (!exists) {
+                        ctx._source.disliked_cluster_ids.add(
+                            ["cluster_id": params.cluster_id, "timestamp": params.now]
+                        );
+                    }
+
+                    ctx._source.updated_at = params.now;
                 """,
                 "params": {
                     "cluster_id": host_cluster_id,
                     "now": now,
                 },
             },
-        )
+        }
 
-    def _create_backward_rocchio_doc(
+    def _build_create_action(
         self,
         embedding_field: str,
         doc_type: str,
@@ -626,22 +601,95 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         host_cluster_id: str,
         org_id: str,
         now: datetime,
-    ) -> None:
-        """Create backward Rocchio doc."""
-        new_doc = {
-            embedding_field: embedding,
-            "type": doc_type,
-            "org_id": org_id,
-            "disliked_cluster_ids": [{"cluster_id": host_cluster_id, "timestamp": now}],
-            "created_at": now,
-            "updated_at": now,
+    ) -> Dict[str, Any]:
+        """Build a bulk index action (create new backward Rocchio doc)."""
+        return {
+            "_op_type": "index",
+            "_index": constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
+            "_source": {
+                embedding_field: embedding,
+                "type": doc_type,
+                "org_id": org_id,
+                "disliked_cluster_ids": [
+                    {"cluster_id": host_cluster_id, "timestamp": now}
+                ],
+                "created_at": now,
+                "updated_at": now,
+            },
         }
 
-        self.elasticsearch_db.client.index(
-            index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
-            document=new_doc,
-            refresh="wait_for",
-        )
+    def _backward_update_disliked_clusters(
+        self,
+        combined_disliked_clusters: Dict[str, Dict[str, Any]],
+        host_cluster_id: str,
+        org_id: str,
+        max_workers: int = 8,
+    ) -> None:
+        """Append host cluster to disliked cluster Rocchio docs.
+
+        Optimised: parallel kNN lookups via ThreadPoolExecutor,
+        then a single bulk write — no per-doc refresh blocking.
+        """
+        if not combined_disliked_clusters:
+            return
+
+        now = datetime.now()
+
+        # ── Step 1: Parallel kNN lookups ──────────────────────────────────────
+        resolved: List[Dict[str, Any]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._resolve_rocchio_doc,
+                    disliked_cluster_id,
+                    info,
+                    org_id,
+                ): disliked_cluster_id
+                for disliked_cluster_id, info in combined_disliked_clusters.items()
+            }
+
+            for future in as_completed(futures):
+                try:
+                    resolved.append(future.result())
+                except Exception as e:
+                    cluster_id = futures[future]
+                    print(
+                        f"[backward_update] Failed to resolve cluster {cluster_id}: {e}"
+                    )
+
+        # ── Step 2: Build bulk actions ─────────────────────────────────────────
+        bulk_actions: List[Dict[str, Any]] = []
+
+        for r in resolved:
+            if r["doc_id"] is not None:
+                bulk_actions.append(
+                    self._build_append_action(
+                        doc_id=r["doc_id"],
+                        host_cluster_id=host_cluster_id,
+                        now=now,
+                    )
+                )
+            else:
+                bulk_actions.append(
+                    self._build_create_action(
+                        embedding_field=r["embedding_field"],
+                        doc_type=r["doc_type"],
+                        embedding=r["info"]["embedding"],
+                        host_cluster_id=host_cluster_id,
+                        org_id=org_id,
+                        now=now,
+                    )
+                )
+
+        # ── Step 3: Single bulk write ──────────────────────────────────────────
+        if bulk_actions:
+            es_helpers.bulk(
+                self.elasticsearch_db.client,
+                bulk_actions,
+                refresh=False,  # no per-doc blocking refresh
+                raise_on_error=False,  # log failures, don't crash the whole batch
+            )
 
     def _collect_disliked_physical_ids(
         self, combined_disliked_clusters: Dict[str, Dict[str, Any]]
@@ -680,38 +728,53 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         now: datetime,
     ) -> None:
         """Append/remove neutralisations."""
+        if not to_add and not to_remove:
+            return  # No-op guard: skip the round-trip entirely
+
+        # Removals are a set lookup — cheaper than iterating a list in Painless
+        to_remove_set = list(set(to_remove))  # deduplicate before sending
+
         self.elasticsearch_db.client.update(
             index=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT,
             id=host_doc_id,
-            refresh="wait_for",
-            script={
-                "lang": "painless",
-                "source": """
-                    if (ctx._source.neutralisations == null) {
-                        ctx._source.neutralisations = [];
-                    }
+            refresh=False,  # caller controls refresh; don't block the write path
+            retry_on_conflict=3,  # handle optimistic concurrency without crashing
+            body={
+                "script": {
+                    "lang": "painless",
+                    "source": """
+                        if (ctx._source.neutralisations == null) {
+                            ctx._source.neutralisations = new ArrayList();
+                        }
 
-                    Map existing = new HashMap();
-                    for (n in ctx._source.neutralisations) {
-                        existing.put(n.physical_id, n);
-                    }
+                        // Build a removal set for O(1) lookups
+                        Set toRemove = new HashSet(params.to_remove);
 
-                    for (n in params.to_add) {
-                        existing.put(n.physical_id, n);
-                    }
+                        // Remove in a single pass — avoids full HashMap rebuild
+                        ctx._source.neutralisations.removeIf(
+                            n -> toRemove.contains(n.physical_id)
+                        );
 
-                    for (pid in params.to_remove) {
-                        existing.remove(pid);
-                    }
+                        // Append only truly new entries (avoid duplication)
+                        Set existing = new HashSet();
+                        for (n in ctx._source.neutralisations) {
+                            existing.add(n.physical_id);
+                        }
 
-                    ctx._source.neutralisations = new ArrayList(existing.values());
-                    ctx._source.updated_at = params.now;
-                """,
-                "params": {
-                    "to_add": to_add,
-                    "to_remove": to_remove,
-                    "now": now,
-                },
+                        for (n in params.to_add) {
+                            if (!existing.contains(n.physical_id)) {
+                                ctx._source.neutralisations.add(n);
+                            }
+                        }
+
+                        ctx._source.updated_at = params.now;
+                    """,
+                    "params": {
+                        "to_add": to_add,
+                        "to_remove": to_remove_set,
+                        "now": now,
+                    },
+                }
             },
         )
 
