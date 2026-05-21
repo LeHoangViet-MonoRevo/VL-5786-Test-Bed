@@ -477,10 +477,8 @@ class SimilaritySearchService:
         show_disliked_drawings: bool,
     ) -> pd.DataFrame:
         """Adjust results using Rocchio 2D dislike feedback."""
-        # TODO: If show_disliked_drawings is False -> No need to retrieve disliked items from ES
 
         # Step 1: Retrieve the exact match from ROCCHIO index
-        # Bottleneck 1
         _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
             project_id, company_id
         )
