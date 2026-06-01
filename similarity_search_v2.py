@@ -1,3 +1,4 @@
+import concurrent.futures
 import time
 import traceback
 from datetime import datetime
@@ -137,6 +138,85 @@ class SimilaritySearchService:
         )
         self.rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
 
+    def _extract_crop_features(self, hits: list) -> tuple:
+        """Decode ES hits into images, extract feature vectors, and return (crop_base64, list_query)."""
+        t0 = time.perf_counter()
+        crop_base64 = list(hits)
+        list_query = [
+            self.extract_feature(base64_to_image(image["_source"]["data"]))
+            for image in crop_base64
+        ]
+        logger.info(f"Feature extraction time: {time.perf_counter() - t0:.4f}s")
+        return crop_base64, list_query
+
+    def _build_v2_results(
+        self,
+        similar_df: pd.DataFrame,
+        result_similarity_by_ocr: pd.DataFrame,
+        num_detected: int,
+        project_id: str,
+    ) -> pd.DataFrame:
+        """Score, aggregate, and merge CNN similarity results with OCR matches to produce the v2 result DataFrame."""
+        similar_df["number_detected_object"] = num_detected
+        similar_df_score_higher = similar_df[similar_df["score"] >= 0.7]
+        similar_df_score_lower = similar_df[similar_df["score"] < 0.7]
+        similar_df_score_lower = similar_df_score_lower[
+            ~similar_df_score_lower["product_id"].isin(
+                similar_df_score_higher["product_id"].to_list()
+            )
+        ]
+
+        similar_df = pd.concat(
+            [similar_df_score_higher, similar_df_score_lower], ignore_index=True
+        )
+
+        parent_df = similar_df[["original_image", "parent"]].drop_duplicates()
+
+        final_df = (
+            similar_df.groupby(["parent", "number_objects", "number_detected_object"])
+            .agg({"index": "count", "score": "sum"})
+            .reset_index()
+            .rename(columns={"index": "count_appearance"})
+            .sort_values(by="count_appearance", ascending=False)
+            .reset_index(drop=True)
+        )
+        product_id_keep = similar_df[["parent", "product_id"]].drop_duplicates(
+            subset="parent"
+        )
+        final_df["denominator"] = final_df[
+            ["number_objects", "number_detected_object", "count_appearance"]
+        ].max(axis=1)
+        final_df["score"] = final_df["score"] / (
+            final_df["denominator"]
+            + abs(final_df["number_detected_object"] - final_df["number_objects"])
+        )
+        final_df = final_df.sort_values(by="score", ascending=False)
+
+        results = pd.merge(final_df, product_id_keep, on="parent")
+        results = results.rename(columns={"product_id": "physical_id"})
+        results = results.drop_duplicates(subset=["physical_id"], keep="first")
+        results = results.sort_values(by="score", ascending=False).reset_index()
+
+        results = pd.merge(
+            results[["physical_id", "score", "parent"]], parent_df, on="parent"
+        )
+        results = results.drop(columns=["parent"]).rename(
+            columns={"original_image": "parent"}
+        )
+
+        final_result_ocr = pd.concat([result_similarity_by_ocr, results])
+        final_result_ocr = (
+            final_result_ocr.sort_values(by="score", ascending=False)
+            .drop_duplicates(subset=["parent", "physical_id"], keep="first")
+            .reset_index()
+        )
+        final_result_ocr["physical_id"] = final_result_ocr["physical_id"].astype(int)
+
+        results_v2 = final_result_ocr[["physical_id", "score", "parent"]]
+        results_v2["version"] = "v2"
+
+        return results_v2
+
     def _merge_v2_v3_results(
         self,
         results_v2: pd.DataFrame,
@@ -145,6 +225,7 @@ class SimilaritySearchService:
         company_id: str,
         show_disliked_drawings: bool,
     ):
+        """Normalise, concat, deduplicate v2 and v3 results, apply dislike filtering, and return ranked record lists."""
         required_cols = ["physical_id", "score", "parent", "version"]
         normalized = []
         for df, version_name in [(results_v2, "v2"), (results_v3, "v3")]:
@@ -180,13 +261,18 @@ class SimilaritySearchService:
         )
 
         return (
-            final_result[["physical_id", "score", "parent", "reaction"]],
-            final_result[["physical_id", "score", "parent", "version", "reaction"]],
+            final_result[["physical_id", "score", "parent", "reaction"]].to_dict(
+                "records"
+            ),
+            final_result[
+                ["physical_id", "score", "parent", "version", "reaction"]
+            ].to_dict("records"),
         )
 
     def _match_ocr_results(
         self, basic_info_metadata: pd.DataFrame, ocr_result, project_id: str
     ) -> pd.DataFrame:
+        """Filter basic_info_metadata by OCR fields and return matched rows as a physical_id/parent/score DataFrame."""
         empty = pd.DataFrame(columns=["physical_id", "parent", "score"])
         try:
             if basic_info_metadata.empty:
@@ -251,17 +337,6 @@ class SimilaritySearchService:
             logger.warning(traceback.format_exc())
             result = empty
 
-        logger.info(
-            "[OCR MATCH] project_id=%s ocr_result=%s matched_physical_ids=%s",
-            project_id,
-            {
-                "product_name": getattr(ocr_result, "ocr_product_name", None),
-                "product_code": getattr(ocr_result, "ocr_product_code", None),
-                "drawing_number": getattr(ocr_result, "ocr_drawing_number", None),
-                "drawing_issuer": getattr(ocr_result, "ocr_drawing_issuer", None),
-            },
-            result["physical_id"].tolist(),
-        )
         return result
 
     def check_production_info(self, word):
@@ -677,141 +752,81 @@ class SimilaritySearchService:
         show_disliked_drawings: bool = True,
     ):
         """Extract crop features, merge v2 (CNN) and v3 (phash) search results with OCR matches, apply feedback, and return ranked physical-ID lists."""
-        try:
-            image_info = elasticsearch_db.find(
-                indice_name=constants.ZONE_ENCODED_DATA_PHYSICAL_OBJECT_2D,
-                field_name="object_id",
-                value=project_id,
-            )
-            t0 = time.perf_counter()
-            crop_base64 = [x for x in image_info["hits"]["hits"]]
-            list_query = []
-            for image in crop_base64:
-                # crop = base64_to_image(image["image_base64"])
-                crop = base64_to_image(image["_source"]["data"])
-                list_query.append(self.extract_feature(crop))
-            t1 = time.perf_counter()
-            logger.info(f"Feature extraction time: {t1 - t0:.4f}s")
-            # Feedback handling
-            host_match = self.rocchio_feedback_2d.execute_feedback_update_2d(
-                project_id=project_id, org_id=company_id, feedback_list=feedback_list
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            # V3 only needs project_id + company_id, so kick it off immediately in parallel with V2.
+            future_v3 = executor.submit(
+                similarity_search_v3.search_similar_project_v3, project_id, company_id
             )
 
-            list_query = self.rocchio_feedback_2d.update_vectors_w_rocchio_2d(
-                query_vectors=list_query,
-                feedback_list=feedback_list,
-                host_match=host_match,
-                org_id=company_id,
-            )
-
-            similar_df = self.search_similar_project(
-                list_query,
-                company_id,
-            )
-            if similar_df is None:
-                return [], []
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            raise SearchException(
-                f"search failed {e}", errors=ErrorCodeAISystem.RAI_SYS_003.name
-            )
-
-        try:
-            result_similarity_by_ocr = self._match_ocr_results(
-                basic_info_metadata, ocr_result, project_id
-            )
-            similar_df["number_detected_object"] = len(crop_base64)
-            similar_df_score_higher = similar_df[similar_df["score"] >= 0.7]
-            similar_df_score_lower = similar_df[similar_df["score"] < 0.7]
-            similar_df_score_lower = similar_df_score_lower[
-                ~similar_df_score_lower["product_id"].isin(
-                    similar_df_score_higher["product_id"].to_list()
+            try:
+                image_info = elasticsearch_db.find(
+                    indice_name=constants.ZONE_ENCODED_DATA_PHYSICAL_OBJECT_2D,
+                    field_name="object_id",
+                    value=project_id,
                 )
-            ]
-
-            similar_df = pd.concat(
-                [similar_df_score_higher, similar_df_score_lower], ignore_index=True
-            )
-
-            parent_df = similar_df[["original_image", "parent"]].drop_duplicates()
-
-            final_df = (
-                similar_df.groupby(
-                    ["parent", "number_objects", "number_detected_object"]
+                crop_base64, list_query = self._extract_crop_features(
+                    image_info["hits"]["hits"]
                 )
-                .agg({"index": "count", "score": "sum"})
-                .reset_index()
-                .rename(columns={"index": "count_appearance"})
-                .sort_values(by="count_appearance", ascending=False)
-                .reset_index(drop=True)
-            )
-            product_id_keep = similar_df[["parent", "product_id"]].drop_duplicates(
-                subset="parent"
-            )
-            final_df["denominator"] = final_df[
-                ["number_objects", "number_detected_object", "count_appearance"]
-            ].max(axis=1)
-            final_df["score"] = final_df["score"] / (
-                final_df["denominator"]
-                + abs(final_df["number_detected_object"] - final_df["number_objects"])
-            )
-            final_df = final_df.sort_values(by="score", ascending=False)
+                # Feedback handling
+                host_match = self.rocchio_feedback_2d.execute_feedback_update_2d(
+                    project_id=project_id,
+                    org_id=company_id,
+                    feedback_list=feedback_list,
+                )
 
-            results = pd.merge(final_df, product_id_keep, on="parent")
-            results = results.rename(columns={"product_id": "physical_id"})
-            results = results.drop_duplicates(subset=["physical_id"], keep="first")
-            results = results.sort_values(by="score", ascending=False).reset_index()
+                list_query = self.rocchio_feedback_2d.update_vectors_w_rocchio_2d(
+                    query_vectors=list_query,
+                    feedback_list=feedback_list,
+                    host_match=host_match,
+                    org_id=company_id,
+                )
 
-            results = pd.merge(
-                results[["physical_id", "score", "parent"]], parent_df, on="parent"
-            )
-            results = results.drop(columns=["parent"])
-            results = results.rename(columns={"original_image": "parent"})
-            final_result_ocr = pd.concat([result_similarity_by_ocr, results])
-            final_result_ocr = (
-                final_result_ocr.sort_values(by="score", ascending=False)
-                .drop_duplicates(subset=["parent", "physical_id"], keep="first")
-                .reset_index()
-            )
-            final_result_ocr["physical_id"] = final_result_ocr["physical_id"].astype(
-                int
-            )
-            results_v2 = final_result_ocr[["physical_id", "score", "parent"]]
-            results_v2["version"] = "v2"
+                similar_df = self.search_similar_project(
+                    list_query,
+                    company_id,
+                )
+                if similar_df is None:
+                    future_v3.cancel()
+                    return [], []
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                raise SearchException(
+                    f"search failed {e}", errors=ErrorCodeAISystem.RAI_SYS_003.name
+                )
 
-            logger.info(
-                f"[V2 RESULT] project_id={project_id} physical_ids="
-                f"{results_v2[['physical_id', 'score']].to_dict('records')}"
-            )
+            try:
+                result_similarity_by_ocr = self._match_ocr_results(
+                    basic_info_metadata, ocr_result, project_id
+                )
+                results_v2 = self._build_v2_results(
+                    similar_df, result_similarity_by_ocr, len(crop_base64), project_id
+                )
 
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            raise AISystemError(
-                f"system processed failed {e}",
-                errors=ErrorCodeAISystem.RAI_SYS_004.name,
-            )
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                raise AISystemError(
+                    f"system processed failed {e}",
+                    errors=ErrorCodeAISystem.RAI_SYS_004.name,
+                )
 
-        ### Raijin search V3 (safe version)
-        try:
-            results_v3, image_phash = similarity_search_v3.search_similar_project_v3(
-                project_id, company_id
-            )
+            ### Raijin search V3 (safe version)
+            try:
+                results_v3, _ = future_v3.result()
 
-            logger.info(
-                f"[V3 RESULT] project_id={project_id} physical_ids="
-                f"{results_v3[['physical_id', 'score']].to_dict('records') if results_v3 is not None else None}"
-            )
+                return self._merge_v2_v3_results(
+                    results_v2,
+                    results_v3,
+                    project_id,
+                    company_id,
+                    show_disliked_drawings,
+                )
 
-            return self._merge_v2_v3_results(
-                results_v2, results_v3, project_id, company_id, show_disliked_drawings
-            )
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            raise AISystemError(
-                f"system processed failed {e}",
-                errors=ErrorCodeAISystem.RAI_SYS_004.name,
-            )
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                raise AISystemError(
+                    f"system processed failed {e}",
+                    errors=ErrorCodeAISystem.RAI_SYS_004.name,
+                )
 
 
 class DummyOCRResult:
@@ -852,4 +867,4 @@ if __name__ == "__main__":
     )
     t1 = time.perf_counter()
     print(f"Time taken: {t1 - t0:.4f} seconds")
-    print(f"res: {res}")
+    # print(f"res: {res}")
