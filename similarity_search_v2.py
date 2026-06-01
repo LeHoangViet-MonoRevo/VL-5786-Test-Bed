@@ -1,6 +1,7 @@
 import time
 import traceback
 from datetime import datetime
+from itertools import chain
 from typing import Dict, List, Set, Tuple, Union
 
 import imagehash
@@ -128,6 +129,7 @@ similarity_search_v3 = SimilaritySearchV3()
 
 class SimilaritySearchService:
     def __init__(self):
+        """Load ML models and initialise Rocchio 2D feedback handler."""
         self.device = settings.DEVICE
         self.model_text_classification = model_loader.load_word_classification_model()
         self.model_extract = model_loader.load_model_extraction(
@@ -135,7 +137,135 @@ class SimilaritySearchService:
         )
         self.rocchio_feedback_2d = RocchioFeedback2D(elasticsearch_db)
 
+    def _merge_v2_v3_results(
+        self,
+        results_v2: pd.DataFrame,
+        results_v3: pd.DataFrame,
+        project_id: str,
+        company_id: str,
+        show_disliked_drawings: bool,
+    ):
+        required_cols = ["physical_id", "score", "parent", "version"]
+        normalized = []
+        for df, version_name in [(results_v2, "v2"), (results_v3, "v3")]:
+            if df is None:
+                df = pd.DataFrame(columns=required_cols)
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = None
+            df["version"] = version_name
+            normalized.append(df)
+        results_v2, results_v3 = normalized
+
+        final_result = pd.concat([results_v3, results_v2], ignore_index=True)
+        final_result["score"] = pd.to_numeric(final_result["score"], errors="coerce")
+
+        if final_result["score"].isna().all():
+            logger.warning("Both results_v2 and results_v3 are empty → returning []")
+            return [], []
+
+        final_result = SimilaritySearchService.sort_by_score_and_physical_id(
+            final_result
+        )
+        final_result = final_result.drop_duplicates(
+            subset=["physical_id"], keep="first"
+        ).reset_index(drop=True)
+
+        final_result["reaction"] = 0
+        final_result = self.process_dislikes_2d(
+            result=final_result,
+            project_id=project_id,
+            company_id=company_id,
+            show_disliked_drawings=show_disliked_drawings,
+        )
+
+        return (
+            final_result[["physical_id", "score", "parent", "reaction"]],
+            final_result[["physical_id", "score", "parent", "version", "reaction"]],
+        )
+
+    def _match_ocr_results(
+        self, basic_info_metadata: pd.DataFrame, ocr_result, project_id: str
+    ) -> pd.DataFrame:
+        empty = pd.DataFrame(columns=["physical_id", "parent", "score"])
+        try:
+            if basic_info_metadata.empty:
+                result = empty
+            else:
+                basic_info_metadata = basic_info_metadata.rename(
+                    columns={
+                        "id": "physical_id",
+                        "product_no": "ocr_product_code",
+                        "product_name": "ocr_product_name",
+                        "figure_number": "ocr_drawing_number",
+                        "customer_name": "ocr_drawing_issuer",
+                        "location": "parent",
+                    }
+                )
+                mask_should = pd.Series(False, index=basic_info_metadata.index)
+                if ocr_result.ocr_product_name:
+                    mask_should |= (
+                        basic_info_metadata["ocr_product_name"]
+                        == ocr_result.ocr_product_name
+                    )
+                if ocr_result.ocr_product_code:
+                    mask_should |= (
+                        basic_info_metadata["ocr_product_code"]
+                        == ocr_result.ocr_product_code
+                    )
+                if ocr_result.ocr_drawing_number:
+                    mask_should |= (
+                        basic_info_metadata["ocr_drawing_number"]
+                        == ocr_result.ocr_drawing_number
+                    )
+                if ocr_result.ocr_drawing_issuer:
+                    mask_should |= (
+                        basic_info_metadata["ocr_drawing_issuer"]
+                        == ocr_result.ocr_drawing_issuer
+                    )
+
+                result = basic_info_metadata[mask_should]
+                if result.empty:
+                    result = empty
+                else:
+                    result["score"] = 1
+                    for col in [
+                        "ocr_product_name",
+                        "ocr_product_code",
+                        "ocr_drawing_number",
+                        "ocr_drawing_issuer",
+                    ]:
+                        result[col] = result[col].apply(
+                            lambda x: (
+                                self.check_production_info(x) if pd.notna(x) else x
+                            )
+                        )
+                    result = result[
+                        (result["ocr_product_name"] == "answer")
+                        | (result["ocr_product_code"] == "answer")
+                        | (result["ocr_drawing_number"] == "answer")
+                        | (result["ocr_drawing_issuer"] == "answer")
+                    ]
+                    result = result[["physical_id", "parent", "score"]]
+        except Exception:
+            logger.warning(traceback.format_exc())
+            result = empty
+
+        logger.info(
+            "[OCR MATCH] project_id=%s ocr_result=%s matched_physical_ids=%s",
+            project_id,
+            {
+                "product_name": getattr(ocr_result, "ocr_product_name", None),
+                "product_code": getattr(ocr_result, "ocr_product_code", None),
+                "drawing_number": getattr(ocr_result, "ocr_drawing_number", None),
+                "drawing_issuer": getattr(ocr_result, "ocr_drawing_issuer", None),
+            },
+            result["physical_id"].tolist(),
+        )
+        return result
+
     def check_production_info(self, word):
+        """Classify a text token as 'question' or 'answer' using the word classification model."""
         probabilities = self.model_text_classification.predict_proba([word])
         if probabilities[0][1] >= constants.THRESHOLD_TEXT_CLASSIFICATION_QUESTION:
             predicted_label = "question"
@@ -144,6 +274,7 @@ class SimilaritySearchService:
         return predicted_label
 
     def extract_feature(self, img) -> np.array:
+        """Preprocess an image and return its L2-normalised feature embedding vector."""
         img = img.resize((224, 224))
         img = img.convert("RGB")
 
@@ -166,6 +297,7 @@ class SimilaritySearchService:
 
     @staticmethod
     def _es_search_sequential(list_query_vector, company_id, selected_cols):
+        """Query Elasticsearch one vector at a time and concatenate all hit DataFrames."""
         indice_name = constants.ELASTICSEARCH_PREFIX
         result_similarity = pd.DataFrame()
 
@@ -201,9 +333,8 @@ class SimilaritySearchService:
 
     @staticmethod
     def _es_search_batch(list_query_vector, company_id, selected_cols):
-        # TODO: Optimise this function
+        """Query Elasticsearch for all vectors in a single _msearch request and concatenate hit DataFrames."""
         indice_name = constants.ELASTICSEARCH_PREFIX
-        result_similarity = pd.DataFrame()
 
         batch_results = elasticsearch_db.search_vectors_batch(
             indice_name=indice_name,
@@ -213,29 +344,22 @@ class SimilaritySearchService:
             selected_cols=selected_cols,
         )
 
-        for res in batch_results["responses"]:
-            if "hits" not in res or not res["hits"]["hits"]:
-                continue
-
-            hits = res["hits"]["hits"]
-            if not hits:
-                continue
-
-            df_res = pd.json_normalize(hits)
-            if df_res.empty:
-                continue
-
-            result_similarity = pd.concat(
-                [result_similarity, df_res], ignore_index=True
+        all_hits = list(
+            chain.from_iterable(
+                res["hits"]["hits"]
+                for res in batch_results.get("responses", [])
+                if res.get("hits", {}).get("hits")
             )
+        )
 
-        return result_similarity
+        return pd.json_normalize(all_hits) if all_hits else pd.DataFrame()
 
     def search_similar_project(
         self,
         list_query_vector,
         company_id: str,
     ) -> pd.DataFrame:
+        """Run a batch vector search and return a deduplicated DataFrame of similar products ranked by score."""
         indice_name = constants.ELASTICSEARCH_PREFIX
         if not elasticsearch_db.check_indice_existance(indice_name=indice_name):
             return None
@@ -552,19 +676,22 @@ class SimilaritySearchService:
         feedback_list: List[Tuple] = [],
         show_disliked_drawings: bool = True,
     ):
+        """Extract crop features, merge v2 (CNN) and v3 (phash) search results with OCR matches, apply feedback, and return ranked physical-ID lists."""
         try:
             image_info = elasticsearch_db.find(
                 indice_name=constants.ZONE_ENCODED_DATA_PHYSICAL_OBJECT_2D,
                 field_name="object_id",
                 value=project_id,
             )
+            t0 = time.perf_counter()
             crop_base64 = [x for x in image_info["hits"]["hits"]]
             list_query = []
             for image in crop_base64:
                 # crop = base64_to_image(image["image_base64"])
                 crop = base64_to_image(image["_source"]["data"])
                 list_query.append(self.extract_feature(crop))
-
+            t1 = time.perf_counter()
+            logger.info(f"Feature extraction time: {t1 - t0:.4f}s")
             # Feedback handling
             host_match = self.rocchio_feedback_2d.execute_feedback_update_2d(
                 project_id=project_id, org_id=company_id, feedback_list=feedback_list
@@ -590,100 +717,9 @@ class SimilaritySearchService:
             )
 
         try:
-            # query product information
-            try:
-                if basic_info_metadata.empty:
-                    result_similarity_by_ocr = pd.DataFrame(
-                        columns=["physical_id", "parent", "score"]
-                    )
-                else:
-                    basic_info_metadata = basic_info_metadata.rename(
-                        columns={
-                            "id": "physical_id",
-                            "product_no": "ocr_product_code",
-                            "product_name": "ocr_product_name",
-                            "figure_number": "ocr_drawing_number",
-                            "customer_name": "ocr_drawing_issuer",
-                            "location": "parent",
-                        }
-                    )
-                    mask_should = pd.Series(False, index=basic_info_metadata.index)
-                    if ocr_result.ocr_product_name:
-                        mask_should |= (
-                            basic_info_metadata["ocr_product_name"]
-                            == ocr_result.ocr_product_name
-                        )
-                    if ocr_result.ocr_product_code:
-                        mask_should |= (
-                            basic_info_metadata["ocr_product_code"]
-                            == ocr_result.ocr_product_code
-                        )
-                    if ocr_result.ocr_drawing_number:
-                        mask_should |= (
-                            basic_info_metadata["ocr_drawing_number"]
-                            == ocr_result.ocr_drawing_number
-                        )
-                    if ocr_result.ocr_drawing_issuer:
-                        mask_should |= (
-                            basic_info_metadata["ocr_drawing_issuer"]
-                            == ocr_result.ocr_drawing_issuer
-                        )
-
-                    result_similarity_by_ocr = basic_info_metadata[mask_should]
-                    if result_similarity_by_ocr.empty:
-                        result_similarity_by_ocr = pd.DataFrame(
-                            columns=["physical_id", "parent", "score"]
-                        )
-                    else:
-                        result_similarity_by_ocr["score"] = 1
-                        result_similarity_by_ocr[
-                            "ocr_product_name"
-                        ] = result_similarity_by_ocr["ocr_product_name"].apply(
-                            lambda x: (
-                                self.check_production_info(x) if pd.notna(x) else x
-                            )
-                        )
-                        result_similarity_by_ocr[
-                            "ocr_product_code"
-                        ] = result_similarity_by_ocr["ocr_product_code"].apply(
-                            lambda x: (
-                                self.check_production_info(x) if pd.notna(x) else x
-                            )
-                        )
-                        result_similarity_by_ocr[
-                            "ocr_drawing_number"
-                        ] = result_similarity_by_ocr["ocr_drawing_number"].apply(
-                            lambda x: (
-                                self.check_production_info(x) if pd.notna(x) else x
-                            )
-                        )
-                        result_similarity_by_ocr[
-                            "ocr_drawing_issuer"
-                        ] = result_similarity_by_ocr["ocr_drawing_issuer"].apply(
-                            lambda x: (
-                                self.check_production_info(x) if pd.notna(x) else x
-                            )
-                        )
-                        result_similarity_by_ocr = result_similarity_by_ocr[
-                            (result_similarity_by_ocr["ocr_product_name"] == "answer")
-                            | (result_similarity_by_ocr["ocr_product_code"] == "answer")
-                            | (
-                                result_similarity_by_ocr["ocr_drawing_number"]
-                                == "answer"
-                            )
-                            | (
-                                result_similarity_by_ocr["ocr_drawing_issuer"]
-                                == "answer"
-                            )
-                        ]
-                        result_similarity_by_ocr = result_similarity_by_ocr[
-                            ["physical_id", "parent", "score"]
-                        ]
-            except Exception as e:
-                logger.warning(traceback.format_exc())
-                result_similarity_by_ocr = pd.DataFrame(
-                    columns=["physical_id", "parent", "score"]
-                )
+            result_similarity_by_ocr = self._match_ocr_results(
+                basic_info_metadata, ocr_result, project_id
+            )
             similar_df["number_detected_object"] = len(crop_base64)
             similar_df_score_higher = similar_df[similar_df["score"] >= 0.7]
             similar_df_score_lower = similar_df[similar_df["score"] < 0.7]
@@ -743,6 +779,11 @@ class SimilaritySearchService:
             results_v2 = final_result_ocr[["physical_id", "score", "parent"]]
             results_v2["version"] = "v2"
 
+            logger.info(
+                f"[V2 RESULT] project_id={project_id} physical_ids="
+                f"{results_v2[['physical_id', 'score']].to_dict('records')}"
+            )
+
         except Exception as e:
             logger.error(traceback.format_exc())
             raise AISystemError(
@@ -756,56 +797,13 @@ class SimilaritySearchService:
                 project_id, company_id
             )
 
-            # Ensure both results DataFrames exist and have consistent columns
-            required_cols = ["physical_id", "score", "parent", "version"]
-            for df, version_name in [(results_v2, "v2"), (results_v3, "v3")]:
-                if df is None:
-                    df = pd.DataFrame(columns=required_cols)
-                for col in required_cols:
-                    if col not in df.columns:
-                        df[col] = None
-                df["version"] = version_name
-                # Assign back if it's results_v2 or results_v3
-                if version_name == "v2":
-                    results_v2 = df
-                else:
-                    results_v3 = df
-
-            # Combine both sets
-            final_result = pd.concat([results_v3, results_v2], ignore_index=True)
-
-            # Ensure numeric score column
-            final_result["score"] = pd.to_numeric(
-                final_result["score"], errors="coerce"
+            logger.info(
+                f"[V3 RESULT] project_id={project_id} physical_ids="
+                f"{results_v3[['physical_id', 'score']].to_dict('records') if results_v3 is not None else None}"
             )
 
-            # Early exit if both are empty
-            if final_result["score"].isna().all():
-                logger.warning(
-                    "Both results_v2 and results_v3 are empty → returning []"
-                )
-                return [], []
-
-            # Sort and deduplicate
-            final_result = SimilaritySearchService.sort_by_score_and_physical_id(
-                final_result
-            )
-            final_result = final_result.drop_duplicates(
-                subset=["physical_id"], keep="first"
-            ).reset_index(drop=True)
-
-            # Add "reaction" column
-            final_result["reaction"] = 0
-            final_result = self.process_dislikes_2d(
-                result=final_result,
-                project_id=project_id,
-                company_id=company_id,
-                show_disliked_drawings=show_disliked_drawings,
-            )
-
-            return (
-                final_result[["physical_id", "score", "parent", "reaction"]],
-                final_result[["physical_id", "score", "parent", "version", "reaction"]],
+            return self._merge_v2_v3_results(
+                results_v2, results_v3, project_id, company_id, show_disliked_drawings
             )
 
         except Exception as e:
