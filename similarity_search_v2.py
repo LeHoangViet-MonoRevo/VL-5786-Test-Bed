@@ -752,27 +752,31 @@ class SimilaritySearchService:
         show_disliked_drawings: bool = True,
     ):
         """Extract crop features, merge v2 (CNN) and v3 (phash) search results with OCR matches, apply feedback, and return ranked physical-ID lists."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            # V3 only needs project_id + company_id, so kick it off immediately in parallel with V2.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # V3, ES find+crop, and feedback update are all independent — kick off in parallel.
             future_v3 = executor.submit(
                 similarity_search_v3.search_similar_project_v3, project_id, company_id
             )
+            future_feedback = executor.submit(
+                self.rocchio_feedback_2d.execute_feedback_update_2d,
+                project_id=project_id,
+                org_id=company_id,
+                feedback_list=feedback_list,
+            )
 
-            try:
+            def _fetch_crop_features():
                 image_info = elasticsearch_db.find(
                     indice_name=constants.ZONE_ENCODED_DATA_PHYSICAL_OBJECT_2D,
                     field_name="object_id",
                     value=project_id,
                 )
-                crop_base64, list_query = self._extract_crop_features(
-                    image_info["hits"]["hits"]
-                )
-                # Feedback handling
-                host_match = self.rocchio_feedback_2d.execute_feedback_update_2d(
-                    project_id=project_id,
-                    org_id=company_id,
-                    feedback_list=feedback_list,
-                )
+                return self._extract_crop_features(image_info["hits"]["hits"])
+
+            future_crop = executor.submit(_fetch_crop_features)
+
+            try:
+                crop_base64, list_query = future_crop.result()
+                host_match = future_feedback.result()
 
                 list_query = self.rocchio_feedback_2d.update_vectors_w_rocchio_2d(
                     query_vectors=list_query,
