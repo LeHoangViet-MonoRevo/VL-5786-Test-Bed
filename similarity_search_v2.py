@@ -3,7 +3,7 @@ import time
 import traceback
 from datetime import datetime
 from itertools import chain
-from typing import Dict, List, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import imagehash
 import numpy as np
@@ -224,6 +224,7 @@ class SimilaritySearchService:
         project_id: str,
         company_id: str,
         show_disliked_drawings: bool,
+        host_match: Optional[Dict] = None,
     ):
         """Normalise, concat, deduplicate v2 and v3 results, apply dislike filtering, and return ranked record lists."""
         required_cols = ["physical_id", "score", "parent", "version"]
@@ -258,15 +259,14 @@ class SimilaritySearchService:
             project_id=project_id,
             company_id=company_id,
             show_disliked_drawings=show_disliked_drawings,
+            host_match=host_match,
         )
 
         return (
-            final_result[["physical_id", "score", "parent", "reaction"]].to_dict(
-                "records"
-            ),
+            final_result[["physical_id", "score", "parent", "reaction"]],
             final_result[
                 ["physical_id", "score", "parent", "version", "reaction"]
-            ].to_dict("records"),
+            ],
         )
 
     def _match_ocr_results(
@@ -674,13 +674,23 @@ class SimilaritySearchService:
         project_id: int,
         company_id: int,
         show_disliked_drawings: bool,
+        host_match: Optional[Dict] = None,
     ) -> pd.DataFrame:
-        """Adjust results using Rocchio 2D dislike feedback."""
+        """Adjust results using Rocchio 2D dislike feedback.
 
-        # Step 1: Retrieve the exact match from ROCCHIO index
-        _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
-            project_id, company_id
-        )
+        ``host_match`` is the fresh Rocchio host record already produced by
+        execute_feedback_update_2d. When provided we reuse it directly and skip
+        the expensive retrieve_2d_exact_match (image load + pHash + kNN search).
+        Falls back to a fetch only when it is not supplied (e.g. standalone use).
+        """
+
+        # Step 1: Reuse the host match if given; otherwise fetch it.
+        if host_match is not None:
+            match = host_match
+        else:
+            _, match = self.rocchio_feedback_2d.retrieve_2d_exact_match(
+                project_id, company_id
+            )
 
         # Step 2: Get all disliked_cluster_ids from match
         disliked_cluster_info = match.get("disliked_cluster_ids", [])
@@ -823,6 +833,7 @@ class SimilaritySearchService:
                     project_id,
                     company_id,
                     show_disliked_drawings,
+                    host_match=host_match,
                 )
 
             except Exception as e:
@@ -831,7 +842,6 @@ class SimilaritySearchService:
                     f"system processed failed {e}",
                     errors=ErrorCodeAISystem.RAI_SYS_004.name,
                 )
-
 
 class DummyOCRResult:
     def __init__(
@@ -872,3 +882,4 @@ if __name__ == "__main__":
     t1 = time.perf_counter()
     print(f"Time taken: {t1 - t0:.4f} seconds")
     # print(f"res: {res}")
+    res.to_csv("similarity_search_host_match.csv", index=False)

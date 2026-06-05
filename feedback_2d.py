@@ -137,9 +137,9 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
             interactions_save_in_es = self.convert_feedback_to_interactions(
                 feedback_list,
-                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"][
-                    "properties"
-                ]["interactions"]["properties"].keys(),
+                es_constant.SCHEMA_ROCCHIO_HISTORY_PHYSICAL_OBJECT["mappings"]["properties"][
+                    "interactions"
+                ]["properties"].keys(),
             )
 
             if (
@@ -265,6 +265,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         data, dtype = self._load_original_image_b64(project_id)
         hash_vector = self.infer_phash_from_data(data, dtype)
 
+        # TODO: Add the option to search by id to save time
         match = self.find_similar_rocchio_record(
             query_vector=hash_vector,
             search_field="phash_2d",
@@ -355,6 +356,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
         new_clusters: Dict[str, Dict[str, Any]] = {}
 
+        # TODO: Parallelize _find_or_create_cluster calls with ThreadPoolExecutor (same pattern as _backward_update_disliked_clusters)
         for physical_id, info in rem_info.items():
             cluster_id, cluster_data = self._find_or_create_cluster(
                 info["embedding"], info["version"], org_id
@@ -370,9 +372,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         org_id: str,
     ) -> Tuple[str, Dict[str, Any]]:
 
-        embedding_field = (
-            "embedding_vector_3d" if version == "3d" else "embedding_vector_2d"
-        )
+        embedding_field = "embedding_vector_3d" if version == "3d" else "embedding_vector_2d"
 
         filters = [
             {"term": {"org_id": org_id}},
@@ -407,9 +407,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             }
 
         # ❌ NO MATCH → CREATE
-        created = self._create_cluster_from_vector(
-            rep_vec, version=version, org_id=org_id
-        )
+        created = self._create_cluster_from_vector(rep_vec, version=version, org_id=org_id)
 
         return created["doc_id"], {
             "physical_ids": created["physical_ids"],
@@ -435,9 +433,18 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         ):
             self._update_host_doc(match["doc_id"], new_clusters, now)
         else:
-            self._create_host_doc(
-                emb_vector, new_clusters, project_id, org_id, now, type
-            )
+            self._create_host_doc(emb_vector, new_clusters, project_id, org_id, now, type)
+            
+        # Mirror the ES write into the in-memory match so callers can reuse it
+        # without re-fetching (process_dislikes_2d parses timestamp via
+        # datetime.fromisoformat → store the ISO string, matching ES read shape).
+        match.setdefault("disliked_cluster_ids", [])
+        existing_ids = {c.get("cluster_id") for c in match["disliked_cluster_ids"]}
+        for cid in new_clusters.keys():
+            if cid not in existing_ids:
+                match["disliked_cluster_ids"].append(
+                    {"cluster_id": cid, "timestamp": now.isoformat()}
+                )
 
     def _update_host_doc(
         self,
@@ -473,8 +480,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
                 """,
                 "params": {
                     "new_clusters": [
-                        {"cluster_id": cid, "timestamp": now}
-                        for cid in new_clusters.keys()
+                        {"cluster_id": cid, "timestamp": now} for cid in new_clusters.keys()
                     ],
                     "now": now,
                 },
@@ -610,9 +616,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
                 embedding_field: embedding,
                 "type": doc_type,
                 "org_id": org_id,
-                "disliked_cluster_ids": [
-                    {"cluster_id": host_cluster_id, "timestamp": now}
-                ],
+                "disliked_cluster_ids": [{"cluster_id": host_cluster_id, "timestamp": now}],
                 "created_at": now,
                 "updated_at": now,
             },
@@ -654,9 +658,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
                     resolved.append(future.result())
                 except Exception as e:
                     cluster_id = futures[future]
-                    print(
-                        f"[backward_update] Failed to resolve cluster {cluster_id}: {e}"
-                    )
+                    print(f"[backward_update] Failed to resolve cluster {cluster_id}: {e}")
 
         # ── Step 2: Build bulk actions ─────────────────────────────────────────
         bulk_actions: List[Dict[str, Any]] = []
@@ -714,9 +716,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             if pid in disliked_physical_ids
         ]
 
-    def _build_neutralisations_to_remove(
-        self, feedback_list: List[Tuple[int, int]]
-    ) -> List[int]:
+    def _build_neutralisations_to_remove(self, feedback_list: List[Tuple[int, int]]) -> List[int]:
         """Build physical_ids to remove."""
         return [pid for pid, reaction in feedback_list if reaction == -1]
 
@@ -800,18 +800,18 @@ class RocchioFeedback2D(RocchioFeedbackBase):
         )
 
         neutral_feedback_list = [
-            (physical_id, reaction)
-            for physical_id, reaction in feedback_list
-            if reaction == 0
+            (physical_id, reaction) for physical_id, reaction in feedback_list if reaction == 0
         ]
 
-        # Step 0: Filter neutral feedback
+        # Step 0: Filter neutral feedback -> Get disliked feedback
         disliked_feedback_list = self.filter_disliked_feedback(feedback_list)
 
         # Step 1: Retrieve exact match in Rocchio index
         hash_vector, match = self.retrieve_2d_exact_match(project_id, org_id)
 
         # Step 2: Get all disliked_cluster info
+        # TODO: Fan out search_cluster (Step 4) here in parallel with _load_disliked_clusters_from_match —
+        #       search_cluster only needs hash_vector (available now) and has no dependency on Steps 2-3.
         disliked_cluster_info = self._load_disliked_clusters_from_match(match)
 
         # Step 3: Forward (Update host in Rocchio + Update dislikes in similarity_clusters + Add disliked clusters to host in Rocchio)
@@ -821,9 +821,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
         if remaining_feedback:
             print(f"remaining_feedback: {remaining_feedback}")
-            new_disliked_clusters = self._process_remaining_feedback(
-                remaining_feedback, org_id
-            )
+            new_disliked_clusters = self._process_remaining_feedback(remaining_feedback, org_id)
             self._update_or_create_host_doc(
                 match=match,
                 emb_vector=hash_vector,
@@ -834,6 +832,9 @@ class RocchioFeedback2D(RocchioFeedbackBase):
             )
 
         # Step 4: Backward (Update dislikes in Rocchio + Append the host cluster to dislikes in Rocchio)
+        # TODO: If Step 2 TODO is done, retrieve fut_host_cluster.result() here instead of calling search_cluster again
+        # TODO: Remove search_cluster (and _backward_update_disliked_clusters) when combined_disliked_clusters is empty —
+        #       creating a host cluster is unnecessary if there are no disliked items to point back to it.
         host_cluster_id = self.search_cluster(
             vector=hash_vector,
             version="v3",  # Host is image
@@ -871,12 +872,29 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
             to_remove = self._build_neutralisations_to_remove(disliked_feedback_list)
 
+            # TODO: Fuse this call with _update_host_doc (UPDATE mode) into a single Painless script to save one ES round-trip
             self._update_neutralisations_in_es(
                 host_doc_id=host_doc_id,
                 to_add=to_add,
                 to_remove=to_remove,
                 now=now,
             )
+
+            # Mirror the ES neutralisation write into the in-memory match so the
+            # returned host_match is fresh and reusable by process_dislikes_2d.
+            match.setdefault("neutralisations", [])
+            if to_remove:
+                remove_set = set(to_remove)
+                match["neutralisations"] = [
+                    n
+                    for n in match["neutralisations"]
+                    if n.get("physical_id") not in remove_set
+                ]
+            existing_pids = {n.get("physical_id") for n in match["neutralisations"]}
+            for n in to_add:
+                if n["physical_id"] not in existing_pids:
+                    match["neutralisations"].append(n)
+
         return match
 
     def update_vectors_w_rocchio_2d(
@@ -894,9 +912,7 @@ class RocchioFeedback2D(RocchioFeedbackBase):
 
         # Step 2: Only positive feedback
         pos_feedback_list = [
-            (physical_id, reaction)
-            for (physical_id, reaction) in feedback_list
-            if reaction == 1
+            (physical_id, reaction) for (physical_id, reaction) in feedback_list if reaction == 1
         ]
 
         # If nothing new and no previous centroid → no update
