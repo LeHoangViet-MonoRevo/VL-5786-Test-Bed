@@ -264,9 +264,7 @@ class SimilaritySearchService:
 
         return (
             final_result[["physical_id", "score", "parent", "reaction"]],
-            final_result[
-                ["physical_id", "score", "parent", "version", "reaction"]
-            ],
+            final_result[["physical_id", "score", "parent", "version", "reaction"]],
         )
 
     def _match_ocr_results(
@@ -411,13 +409,21 @@ class SimilaritySearchService:
         """Query Elasticsearch for all vectors in a single _msearch request and concatenate hit DataFrames."""
         indice_name = constants.ELASTICSEARCH_PREFIX
 
-        batch_results = elasticsearch_db.search_vectors_batch(
-            indice_name=indice_name,
-            organization_id=company_id,
-            version="v2",
-            list_query_vector=list_query_vector,
-            selected_cols=selected_cols,
-        )
+        try:
+            # raise Exception("simulated ES failure")
+            batch_results = elasticsearch_db.search_vectors_batch(
+                indice_name=indice_name,
+                organization_id=company_id,
+                version="v2",
+                list_query_vector=list_query_vector,
+                selected_cols=selected_cols,
+                terminate_after=15_000,
+            )
+        except Exception:
+            logger.error(
+                f"ES _msearch timed out or failed — returning empty results:\n{traceback.format_exc()}"
+            )
+            return pd.DataFrame()
 
         all_hits = list(
             chain.from_iterable(
@@ -843,6 +849,7 @@ class SimilaritySearchService:
                     errors=ErrorCodeAISystem.RAI_SYS_004.name,
                 )
 
+
 class DummyOCRResult:
     def __init__(
         self,
@@ -868,6 +875,7 @@ if __name__ == "__main__":
     company_id = "1"
     ocr_result = DummyOCRResult()
     basic_info_metadata = get_diagram_ocr_physical_types(company_id)
+    # feedback_list = [(1631, -1)]
     feedback_list = []
     show_disliked_drawings = True
     t0 = time.perf_counter()
@@ -882,4 +890,4 @@ if __name__ == "__main__":
     t1 = time.perf_counter()
     print(f"Time taken: {t1 - t0:.4f} seconds")
     # print(f"res: {res}")
-    res.to_csv("similarity_search_host_match.csv", index=False)
+    res.to_csv("similarity_search_new.csv", index=False)
