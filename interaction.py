@@ -17,6 +17,29 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         self.client = es_client
         self._existing_indices_cache = set()
 
+    @staticmethod
+    def _hydrate_vector_fields(response):
+        """
+        Backward-compatible vector recovery across ES versions.
+
+        ES <= 8.x kept ``dense_vector`` values inside ``_source``; ES 9.x
+        excludes them and returns them only through the response ``fields``
+        block. To support both, merge any field that is *missing* from
+        ``_source`` back into it. Keys already present in ``_source`` (the
+        old behaviour) are left untouched, so existing indices keep working.
+        """
+        if not response:
+            return response
+
+        for hit in response.get("hits", {}).get("hits", []):
+            retrieved = hit.get("fields") or {}
+            src = hit.setdefault("_source", {})
+            for key, value in retrieved.items():
+                if key not in src:
+                    src[key] = value
+
+        return response
+
     def search_vector(
         self,
         indice_name,
@@ -40,11 +63,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                                 "bool": {
                                     "filter": [
                                         {"term": {"version": str(version)}},
-                                        {
-                                            "term": {
-                                                "organization_id": str(organization_id)
-                                            }
-                                        },
+                                        {"term": {"organization_id": str(organization_id)}},
                                     ]
                                 }
                             },
@@ -55,16 +74,12 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                         }
                     },
                 },
-                routing=search_updater_constants.create_routing(
-                    version, organization_id
-                ),
+                routing=search_updater_constants.create_routing(version, organization_id),
             )
 
             return results
         except Exception as e:
-            logger.error(
-                f"Failed to search data from indice {indice_name}. " f"Reason {e}"
-            )
+            logger.error(f"Failed to search data from indice {indice_name}. " f"Reason {e}")
 
     def search_vectors_batch(
         self,
@@ -74,6 +89,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         list_query_vector,
         number_retrieval_vector=100,
         selected_cols=["product_id", "original_image"],
+        terminate_after: int | None = None,
     ):
         field_embedding_vector_name = f"embedding_vector_{version}"
 
@@ -101,6 +117,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                         },
                     }
                 },
+                **({"terminate_after": terminate_after} if terminate_after is not None else {}),
             }
 
             body.append(header)
@@ -129,21 +146,21 @@ class ElasticsearchBase(VectorDataBaseInteraction):
 
             # Map method to Elasticsearch script
             if vector_method == "cosine":
-                script_source = (
-                    f"cosineSimilarity(params.query_vector, '{search_field}') + 1.0"
-                )
+                script_source = f"cosineSimilarity(params.query_vector, '{search_field}') + 1.0"
             elif vector_method == "dot":
                 script_source = f"dotProduct(params.query_vector, '{search_field}')"
             elif vector_method == "l2":
-                script_source = (
-                    f"1 / (1 + l2norm(params.query_vector, '{search_field}'))"
-                )
+                script_source = f"1 / (1 + l2norm(params.query_vector, '{search_field}'))"
             else:
                 raise ValueError(f"Unknown vector_method: {vector_method}")
 
             query_body = {
                 "size": number_retrieval_vector,
                 "_source": selected_cols,
+                # Backward compatible: ES 9 drops dense_vector from _source,
+                # so also request the columns via `fields`; _hydrate_vector_fields
+                # merges them in only when missing from _source.
+                "fields": selected_cols,
                 "query": {
                     "script_score": {
                         "query": {"bool": {"filter": filters}},
@@ -160,7 +177,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                 query_body["min_score"] = score_threshold
 
             results = self.client.search(index=indice_name, body=query_body)
-            return results
+            return self._hydrate_vector_fields(results)
 
         except Exception as e:
             logger.error(f"Failed to search data from indice {indice_name}. Reason {e}")
@@ -174,12 +191,18 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         query=None,
         routing_field=None,
         size=10000,
+        fields=None,
     ):
         if query is None and field_name is not None and value is not None:
             if isinstance(value, (list, tuple, set)):
                 query = {"query": {"terms": {field_name: list(value)}}}
             else:
                 query = {"query": {"term": {field_name: value}}}
+
+        # Backward compatible: request dense_vector columns via `fields` so
+        # they are recoverable on ES 9 (no-op on older indices).
+        if fields is not None and query is not None:
+            query.setdefault("fields", fields)
 
         logger.info(f"query ES with command {query}, routing={routing_field}")
 
@@ -188,11 +211,9 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                 index=indice_name, body=query, size=size, routing=routing_field
             )
             logger.info(f"Query '{indice_name}' Successfully.")
-            return response
+            return self._hydrate_vector_fields(response)
         except Exception as e:
-            logger.error(
-                f"Failed to query data from indice {indice_name}. " f"Reason {e}"
-            )
+            logger.error(f"Failed to query data from indice {indice_name}. " f"Reason {e}")
             raise
 
     def insert_vector(self, index_name, document_id):
@@ -240,8 +261,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             self.client.indices.create(index=indice_name, body=body)
         except Exception as e:
             logger.error(
-                f"Failed to create indice {indice_name} from Elasticsearch. "
-                f"Reason {e}"
+                f"Failed to create indice {indice_name} from Elasticsearch. " f"Reason {e}"
             )
 
     def check_indice_existance_noncache(self, indice_name, create=False, body=None):
@@ -296,7 +316,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             logger.error(f"Failed to fetch data from Elasticsearch. Reason {e}")
             return False
 
-    def bulk_insert_vector(self, indice_name, docs, overwrite=True, id_column=None):
+    def bulk_insert_vector(self, indice_name, docs, overwrite=True, id_column=None, refresh=False):
         if not overwrite:
             _op_type = "create"
         else:
@@ -308,17 +328,11 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             if routing:
                 action["_routing"] = routing
             if id_column and id_column in doc:
-                action["_id"] = doc[
-                    id_column
-                ]  # Only set _id if id_column is defined and exists
+                action["_id"] = doc[id_column]  # Only set _id if id_column is defined and exists
             actions.append(action)
         try:
             success, failed = bulk(
-                self.client,
-                actions,
-                stats_only=True,
-                chunk_size=500,
-                request_timeout=60,
+                self.client, actions, stats_only=True, chunk_size=500, request_timeout=60, refresh=refresh
             )
             logger.info(f"✅ Indexed: {success}, ❌ Failed: {failed}")
         except BulkIndexError as e:
@@ -348,11 +362,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                         continue
                     must_conditions.append({"term": {key: str(value)}})
                 should_conditions.append({"bool": {"must": must_conditions}})
-            body = {
-                "query": {
-                    "bool": {"should": should_conditions, "minimum_should_match": 1}
-                }
-            }
+            body = {"query": {"bool": {"should": should_conditions, "minimum_should_match": 1}}}
             routing_param = ",".join(routing_values) if routing_values else None
             response = self.client.delete_by_query(
                 index=indice_name,
@@ -380,11 +390,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
 
         try:
             success, failed = bulk(
-                self.client,
-                actions,
-                stats_only=True,
-                chunk_size=500,
-                request_timeout=60,
+                self.client, actions, stats_only=True, chunk_size=500, request_timeout=60
             )
             logger.info(f"✅ Indexed: {success}, ❌ Failed: {failed}")
         except BulkIndexError as e:
@@ -401,9 +407,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
         Remove entries in neutralisations where physical_id == given physical_id.
         """
 
-        if not self.check_indice_existance(
-            indice_name=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT
-        ):
+        if not self.check_indice_existance(indice_name=constants.ROCCHIO_HISTORY_PHYSICAL_OBJECT):
             return
 
         query = {
@@ -412,9 +416,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     {
                         "nested": {
                             "path": "neutralisations",
-                            "query": {
-                                "term": {"neutralisations.physical_id": physical_id}
-                            },
+                            "query": {"term": {"neutralisations.physical_id": physical_id}},
                         }
                     }
                 ]
@@ -486,8 +488,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
             updated = response.get("updated", 0)
             deleted = response.get("deleted", 0)
             logger.info(
-                f"✅ Removed physical_id {physical_id}: "
-                f"updated={updated}, deleted={deleted}"
+                f"✅ Removed physical_id {physical_id}: " f"updated={updated}, deleted={deleted}"
             )
             return response
 
@@ -564,9 +565,7 @@ class ElasticsearchBase(VectorDataBaseInteraction):
                     },
                     retry_on_conflict=3,  # handles concurrent writers on the same doc
                 )
-                logger.info(
-                    f"✅ Appended physical_id {physical_id} to cluster {doc_id}"
-                )
+                logger.info(f"✅ Appended physical_id {physical_id} to cluster {doc_id}")
 
             else:
                 now = datetime.utcnow().isoformat()

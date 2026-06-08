@@ -106,6 +106,7 @@ class RocchioFeedbackBase:
                 field_name="product_id",
                 value=product_id,
                 routing_field=routing_key,
+                fields=[embedding_vector_field],
             )
             for hit in res["hits"]["hits"]:
                 if hit["_source"]["version"] != embedding_vector_field.split("_")[-1]:
@@ -299,6 +300,8 @@ class RocchioFeedbackBase:
                     "version",
                     "product_id",
                 ],
+                # Backward compatible: recover dense_vector via `fields` on ES 9.
+                "fields": ["embedding_vector_v3", "embedding_vector_3d"],
                 "query": {
                     "bool": {
                         "filter": [
@@ -310,6 +313,9 @@ class RocchioFeedbackBase:
                 },
             },
         )
+
+        # ES 9 excludes dense_vector from _source; merge `fields` back in.
+        resp = self.elasticsearch_db._hydrate_vector_fields(resp)
 
         results = {}
 
@@ -385,7 +391,7 @@ class RocchioFeedbackBase:
             "physical_ids": physical_ids,
             embedding_field: vector,
         }
-
+        print(f"Creating new cluster with vector: {vector}")
         create_resp = self.elasticsearch_db.client.index(
             index=constants.SIMILARITY_CLUSTERS,
             document=doc_body,
